@@ -109,6 +109,20 @@ pub enum DisconnectReason {
     UnknownFromButton(u8),
 }
 
+impl DisconnectReason {
+    /// Whether a reconnect attempt could plausibly succeed after this kind of
+    /// disconnect. `true` means "the pairing is still valid, just re-run
+    /// QuickVerify"; `false` means either the user asked to stop, the pairing was
+    /// invalidated, or the button told us something unrecoverable.
+    #[must_use]
+    pub fn is_retryable(&self) -> bool {
+        matches!(
+            self,
+            DisconnectReason::PingTimeout | DisconnectReason::BleTransport(_)
+        )
+    }
+}
+
 /// Effectful actions the session wants the transport to perform.
 #[derive(Debug, Clone)]
 pub enum SessionAction {
