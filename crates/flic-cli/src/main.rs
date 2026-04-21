@@ -55,6 +55,16 @@ enum Command {
         #[arg(long)]
         creds: PathBuf,
     },
+    /// Forgets a pairing on our side: deletes the credentials file. The button
+    /// still holds our pairing_id in its internal table until it reboots and
+    /// queries `TestIfReallyUnpaired`, or until it's factory-reset physically.
+    Forget {
+        #[arg(long)]
+        creds: PathBuf,
+        /// Skip the interactive confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -81,6 +91,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             peripheral_id,
             creds,
         } => listen(&peripheral_id, &creds).await,
+        Command::Forget { creds, yes } => forget(&creds, yes).await,
     }
 }
 
@@ -117,6 +128,47 @@ async fn scan(seconds: u64) -> anyhow::Result<()> {
     for d in &found {
         println!("  id={} rssi={:?} name={:?}", d.id, d.rssi, d.local_name);
     }
+    Ok(())
+}
+
+async fn forget(creds_path: &Path, skip_confirm: bool) -> anyhow::Result<()> {
+    let stored = match creds::read(creds_path) {
+        Ok(s) => s,
+        Err(e) => {
+            println!("ERROR: cannot read {}: {e}", creds_path.display());
+            std::process::exit(1);
+        }
+    };
+
+    println!("About to forget this pairing:");
+    println!("  serial        {}", stored.serial_number);
+    println!("  pairing_id    {}", stored.pairing_id);
+    println!("  peripheral_id {}", stored.peripheral_id);
+    println!("  file          {}", creds_path.display());
+    println!();
+    println!(
+        "The Flic 2 protocol has no host-initiated unpair. The button keeps our"
+    );
+    println!(
+        "pairing_id in its internal table until it reboots (battery swap) or is"
+    );
+    println!("factory-reset. Until then it will still advertise on clicks.");
+
+    if !skip_confirm {
+        use std::io::{self, Write};
+        print!("Proceed? [y/N] ");
+        io::stdout().flush()?;
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+        if !matches!(input.trim(), "y" | "Y" | "yes") {
+            println!("Aborted.");
+            return Ok(());
+        }
+    }
+
+    std::fs::remove_file(creds_path)?;
+    info!(path = %creds_path.display(), "credentials deleted");
+    println!("Forgotten. {} removed.", creds_path.display());
     Ok(())
 }
 

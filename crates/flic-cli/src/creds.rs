@@ -103,8 +103,11 @@ pub fn write_atomic(creds: &StoredCreds, path: &Path) -> anyhow::Result<()> {
 
 /// Reads and parses a creds file.
 pub fn read(path: &Path) -> anyhow::Result<StoredCreds> {
-    let raw = std::fs::read_to_string(path)?;
-    let creds: StoredCreds = serde_json::from_str(&raw)?;
+    use anyhow::Context;
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("reading credentials file {}", path.display()))?;
+    let creds: StoredCreds = serde_json::from_str(&raw)
+        .with_context(|| format!("parsing credentials file {}", path.display()))?;
     Ok(creds)
 }
 
