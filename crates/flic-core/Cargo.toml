@@ -20,6 +20,7 @@ btleplug = { workspace = true }
 uuid = { workspace = true }
 futures = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 ed25519-dalek = { workspace = true }
 x25519-dalek = { workspace = true }
 sha2 = { workspace = true }

@@ -301,6 +301,24 @@ fn print_event(event: &FlicEvent) {
         FlicEvent::Disconnected { id, reason } => {
             println!("[{}] Disconnected: {reason:?}", short_id(&format!("{id}")));
         }
+        FlicEvent::Reconnecting {
+            id,
+            attempt,
+            after,
+            last_reason,
+        } => {
+            println!(
+                "[{}] Reconnecting in {:.1}s (attempt {attempt}) after {last_reason:?}",
+                short_id(&format!("{id}")),
+                after.as_secs_f32()
+            );
+        }
+        FlicEvent::AdapterUnavailable { id } => {
+            println!(
+                "[{}] Adapter unavailable — waiting for Bluetooth",
+                short_id(&format!("{id}"))
+            );
+        }
     }
 }
 

@@ -13,15 +13,22 @@
 //! The manager handles a single Flic at a time in this first slice. Multi-peripheral
 //! fan-out (one broadcast channel, many per-peripheral tasks) is a later slice.
 
+use std::sync::Arc;
 use std::time::Duration;
 
+use btleplug::api::{Central, CentralEvent, CentralState};
 use btleplug::platform::PeripheralId;
 use futures::stream::StreamExt;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::error::FlicError;
+use crate::reconnect::{
+    ReconnectPolicy, Supervisor, SupervisorAction, SupervisorEvent, SupervisorInput,
+    SupervisorState,
+};
 use crate::session::{
     DisconnectReason, EventResumeState, PairingCredentials, Session, SessionAction, SessionEvent,
     SessionInput,
@@ -52,6 +59,15 @@ pub enum FlicEvent {
         id: PeripheralId,
         reason: DisconnectReason,
     },
+    /// Reconnect supervisor is about to sleep `after` then make `attempt`.
+    Reconnecting {
+        id: PeripheralId,
+        attempt: u32,
+        after: Duration,
+        last_reason: DisconnectReason,
+    },
+    /// BLE adapter powered off — retries paused until it returns.
+    AdapterUnavailable { id: PeripheralId },
 }
 
 const BROADCAST_CAPACITY: usize = 1024;
@@ -64,7 +80,7 @@ const PING_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Single-peripheral manager. One instance handles one Flic at a time.
 pub struct FlicManager {
-    transport: BleTransport,
+    transport: Arc<BleTransport>,
     event_tx: broadcast::Sender<FlicEvent>,
 }
 
@@ -75,7 +91,7 @@ impl FlicManager {
     ///
     /// Returns [`FlicError::BleAdapterUnavailable`] if no BLE adapter is found.
     pub async fn new() -> Result<Self, FlicError> {
-        let transport = BleTransport::new().await?;
+        let transport = Arc::new(BleTransport::new().await?);
         let (event_tx, _) = broadcast::channel(BROADCAST_CAPACITY);
         Ok(Self {
             transport,
@@ -181,6 +197,7 @@ impl FlicManager {
                 &task_id,
                 event_tx,
                 &mut disconnect_rx,
+                None,
             )
             .await
             {
@@ -192,6 +209,87 @@ impl FlicManager {
             task: handle,
             disconnect_tx,
         })
+    }
+
+    /// Runs `listen` in a reconnect supervisor: retryable disconnects trigger
+    /// exponential backoff; fatal disconnects stop the loop; the BLE adapter
+    /// powering off pauses retries until it returns.
+    ///
+    /// `initial_resume` is the starting event-continuity state; the handle's
+    /// `resume_state()` method reports the latest values observed from the
+    /// button, suitable for persisting between restarts.
+    ///
+    /// # Errors
+    ///
+    /// Returns any error that prevents the supervisor task from spawning.
+    pub async fn listen_with_reconnect(
+        &self,
+        id: PeripheralId,
+        creds: PairingCredentials,
+        initial_resume: EventResumeState,
+        policy: ReconnectPolicy,
+    ) -> Result<ReconnectingHandle, FlicError> {
+        let transport = Arc::clone(&self.transport);
+        let event_tx = self.event_tx.clone();
+        let cancel = CancellationToken::new();
+        let runner_cancel = cancel.clone();
+        let (resume_tx, resume_rx) = watch::channel(initial_resume);
+
+        let task = tokio::spawn(async move {
+            if let Err(e) = run_supervisor(
+                transport,
+                id,
+                creds,
+                resume_tx,
+                event_tx,
+                policy,
+                runner_cancel,
+            )
+            .await
+            {
+                error!(?e, "reconnect supervisor exited with error");
+            }
+        });
+
+        Ok(ReconnectingHandle {
+            task,
+            cancel,
+            resume_rx,
+        })
+    }
+}
+
+/// Handle returned from [`FlicManager::listen_with_reconnect`]. Dropping it
+/// detaches the supervisor but does NOT stop it — call [`ReconnectingHandle::disconnect`]
+/// for a clean shutdown.
+pub struct ReconnectingHandle {
+    task: JoinHandle<()>,
+    cancel: CancellationToken,
+    resume_rx: watch::Receiver<EventResumeState>,
+}
+
+impl ReconnectingHandle {
+    /// Requests a clean disconnect and waits for the supervisor to exit.
+    pub async fn disconnect(self) {
+        self.cancel.cancel();
+        let _ = self.task.await;
+    }
+
+    /// Waits for the supervisor to exit on its own (e.g. fatal disconnect).
+    pub async fn wait(self) {
+        let _ = self.task.await;
+    }
+
+    /// Current best estimate of the event-continuity state (for persistence).
+    #[must_use]
+    pub fn resume_state(&self) -> EventResumeState {
+        *self.resume_rx.borrow()
+    }
+
+    /// Subscribe to resume-state updates for a persistence drainer.
+    #[must_use]
+    pub fn subscribe_resume(&self) -> watch::Receiver<EventResumeState> {
+        self.resume_rx.clone()
     }
 }
 
@@ -223,6 +321,7 @@ async fn drive_loop(
     id: &PeripheralId,
     event_tx: broadcast::Sender<FlicEvent>,
     disconnect_rx: &mut tokio::sync::mpsc::Receiver<()>,
+    resume_tx: Option<watch::Sender<EventResumeState>>,
 ) -> Result<(), FlicError> {
     let mut no_op = |_: &PeripheralId, _: &SessionEvent| {};
     let closed = apply_actions(&conn, initial, id, &event_tx, &mut no_op).await?;
@@ -252,6 +351,9 @@ async fn drive_loop(
                     }
                 };
                 let closed = apply_actions(&conn, actions, id, &event_tx, &mut no_op).await?;
+                if let Some(tx) = resume_tx.as_ref() {
+                    let _ = tx.send(session.resume_state());
+                }
                 if closed {
                     return conn.disconnect().await;
                 }
@@ -280,6 +382,284 @@ async fn drive_loop(
                 return conn.disconnect().await;
             }
         }
+    }
+}
+
+/// Runs one `find → connect → listen` attempt. Returns the
+/// [`DisconnectReason`] that ended the session, or an error if the setup
+/// couldn't complete.
+#[derive(Debug, Clone)]
+struct AttemptOutcome {
+    reason: DisconnectReason,
+    reached_established: bool,
+}
+
+async fn run_one_attempt(
+    transport: &BleTransport,
+    id: &PeripheralId,
+    creds: PairingCredentials,
+    resume: EventResumeState,
+    event_tx: broadcast::Sender<FlicEvent>,
+    resume_tx: watch::Sender<EventResumeState>,
+    cancel: &CancellationToken,
+) -> Result<AttemptOutcome, FlicError> {
+    // Scan until the peripheral advertises (or the cancel fires). Flic 2's
+    // advertising is triggered by a click in Private Mode — the caller may
+    // wait minutes here.
+    let id_str = format!("{id}");
+    let find_future = transport.find_peripheral(&id_str, Duration::from_secs(3600));
+    let discovery = tokio::select! {
+        () = cancel.cancelled() => {
+            return Ok(AttemptOutcome {
+                reason: DisconnectReason::ByUser,
+                reached_established: false,
+            });
+        }
+        d = find_future => d?,
+    };
+
+    let conn = transport.connect(&discovery.id).await?;
+    let mut session = Session::new();
+    let initial = session.step(SessionInput::BeginReconnect(creds, resume))?;
+
+    // Subscribe BEFORE starting drive_loop so we don't miss the Connected/
+    // Disconnected events.
+    let mut rx = event_tx.subscribe();
+    let (disconnect_tx, mut disconnect_rx) = tokio::sync::mpsc::channel::<()>(1);
+
+    let drive = {
+        let event_tx = event_tx.clone();
+        let id = id.clone();
+        let resume_tx = resume_tx.clone();
+        tokio::spawn(async move {
+            drive_loop(
+                session,
+                conn,
+                initial,
+                &id,
+                event_tx,
+                &mut disconnect_rx,
+                Some(resume_tx),
+            )
+            .await
+        })
+    };
+
+    let mut reached_established = false;
+    let mut observed_reason: Option<DisconnectReason> = None;
+
+    let exit: Result<(), FlicError> = loop {
+        tokio::select! {
+            () = cancel.cancelled() => {
+                let _ = disconnect_tx.send(()).await;
+                // Fall through and wait for drive to exit.
+                break Ok(());
+            }
+            evt = rx.recv() => {
+                match evt {
+                    Ok(FlicEvent::Connected { id: eid, .. }) if &eid == id => {
+                        reached_established = true;
+                    }
+                    Ok(FlicEvent::EventsResumed { id: eid, .. }) if &eid == id => {
+                        reached_established = true;
+                    }
+                    Ok(FlicEvent::Disconnected { id: eid, reason }) if &eid == id => {
+                        observed_reason = Some(reason);
+                        break Ok(());
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break Ok(()),
+                    _ => {}
+                }
+            }
+        }
+    };
+
+    let _ = exit;
+    let drive_result = drive.await;
+
+    let reason = observed_reason.unwrap_or_else(|| match drive_result {
+        Ok(Ok(())) => DisconnectReason::BleTransport("drive_loop ended without reason".into()),
+        Ok(Err(e)) => DisconnectReason::BleTransport(e.to_string()),
+        Err(join_err) => DisconnectReason::BleTransport(format!("task: {join_err}")),
+    });
+
+    Ok(AttemptOutcome {
+        reason,
+        reached_established,
+    })
+}
+
+async fn run_supervisor(
+    transport: Arc<BleTransport>,
+    id: PeripheralId,
+    creds: PairingCredentials,
+    resume_tx: watch::Sender<EventResumeState>,
+    event_tx: broadcast::Sender<FlicEvent>,
+    policy: ReconnectPolicy,
+    cancel: CancellationToken,
+) -> Result<(), FlicError> {
+    let mut supervisor = Supervisor::new(policy);
+    let mut actions = supervisor.step(SupervisorInput::Start);
+    let mut pending_sleep: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
+
+    // Check adapter state once at start; if not PoweredOn, feed AdapterPowered(false).
+    if transport.adapter_state().await != CentralState::PoweredOn {
+        actions.extend(supervisor.step(SupervisorInput::AdapterPowered(false)));
+    }
+
+    let mut adapter_events = transport
+        .adapter()
+        .events()
+        .await
+        .map_err(|e| FlicError::BleAdapterUnavailable(e.to_string()))?;
+
+    loop {
+        // Drain all queued actions first.
+        let mut maybe_attempt: Option<(PairingCredentials, EventResumeState)> = None;
+        for action in actions.drain(..) {
+            match action {
+                SupervisorAction::InitiateConnect => {
+                    let resume = *resume_tx.subscribe().borrow();
+                    maybe_attempt = Some((creds.clone(), resume));
+                }
+                SupervisorAction::Sleep(d) => {
+                    pending_sleep = Some(Box::pin(tokio::time::sleep(d)));
+                }
+                SupervisorAction::Emit(evt) => {
+                    if let Some(flic_evt) = supervisor_event_to_flic(&id, evt) {
+                        let _ = event_tx.send(flic_evt);
+                    }
+                }
+                SupervisorAction::Stop => return Ok(()),
+            }
+        }
+
+        if let Some((creds, resume)) = maybe_attempt {
+            // Spawn the attempt; race it against cancel/adapter events.
+            let attempt_cancel = cancel.child_token();
+            let attempt = run_one_attempt(
+                transport.as_ref(),
+                &id,
+                creds,
+                resume,
+                event_tx.clone(),
+                resume_tx.clone(),
+                &attempt_cancel,
+            );
+            tokio::pin!(attempt);
+
+            let input = loop {
+                tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => {
+                        attempt_cancel.cancel();
+                        let _ = (&mut attempt).await;
+                        break SupervisorInput::UserDisconnect;
+                    }
+                    evt = adapter_events.next() => {
+                        match evt {
+                            Some(CentralEvent::StateUpdate(state)) => {
+                                let powered = matches!(state, CentralState::PoweredOn);
+                                if !powered {
+                                    attempt_cancel.cancel();
+                                    let _ = (&mut attempt).await;
+                                    break SupervisorInput::AdapterPowered(false);
+                                }
+                            }
+                            None => {
+                                // Adapter event stream ended — rare.
+                                attempt_cancel.cancel();
+                                let _ = (&mut attempt).await;
+                                break SupervisorInput::AttemptFailed(DisconnectReason::BleTransport(
+                                    "adapter event stream ended".into(),
+                                ));
+                            }
+                            _ => {}
+                        }
+                    }
+                    result = &mut attempt => {
+                        break match result {
+                            Ok(outcome) => {
+                                if outcome.reached_established {
+                                    actions.push(SupervisorAction::InitiateConnect); // sentinel
+                                    let mut pre = supervisor.step(SupervisorInput::AttemptSucceeded);
+                                    actions.pop();
+                                    actions.extend(pre.drain(..));
+                                }
+                                SupervisorInput::AttemptFailed(outcome.reason)
+                            }
+                            Err(e) => SupervisorInput::AttemptFailed(DisconnectReason::BleTransport(
+                                e.to_string(),
+                            )),
+                        };
+                    }
+                }
+            };
+            actions.extend(supervisor.step(input));
+            continue;
+        }
+
+        // No attempt queued — wait for sleep/adapter/cancel.
+        if supervisor.state() == SupervisorState::Stopped {
+            return Ok(());
+        }
+
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => {
+                actions.extend(supervisor.step(SupervisorInput::UserDisconnect));
+            }
+            evt = adapter_events.next() => {
+                match evt {
+                    Some(CentralEvent::StateUpdate(state)) => {
+                        let powered = matches!(state, CentralState::PoweredOn);
+                        actions.extend(supervisor.step(SupervisorInput::AdapterPowered(powered)));
+                    }
+                    None => {
+                        actions.extend(supervisor.step(SupervisorInput::AttemptFailed(
+                            DisconnectReason::BleTransport("adapter event stream ended".into()),
+                        )));
+                    }
+                    _ => {}
+                }
+            }
+            () = async {
+                if let Some(s) = pending_sleep.as_mut() {
+                    s.as_mut().await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                pending_sleep = None;
+                actions.extend(supervisor.step(SupervisorInput::BackoffElapsed));
+            }
+        }
+    }
+}
+
+fn supervisor_event_to_flic(id: &PeripheralId, evt: SupervisorEvent) -> Option<FlicEvent> {
+    match evt {
+        SupervisorEvent::Reconnecting {
+            attempt,
+            after,
+            last_reason,
+        } => Some(FlicEvent::Reconnecting {
+            id: id.clone(),
+            attempt,
+            after,
+            last_reason,
+        }),
+        SupervisorEvent::AdapterUnavailable => Some(FlicEvent::AdapterUnavailable { id: id.clone() }),
+        SupervisorEvent::Stopped {
+            final_reason: Some(reason),
+        } => Some(FlicEvent::Disconnected {
+            id: id.clone(),
+            reason,
+        }),
+        SupervisorEvent::Stopped { final_reason: None } => Some(FlicEvent::Disconnected {
+            id: id.clone(),
+            reason: DisconnectReason::ByUser,
+        }),
     }
 }
 
