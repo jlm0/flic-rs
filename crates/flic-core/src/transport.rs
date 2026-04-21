@@ -69,6 +69,23 @@ impl BleTransport {
             .unwrap_or(CentralState::Unknown)
     }
 
+    /// Fail fast when the adapter is definitively not powered on. `Unknown`
+    /// passes through (callers should try anyway — macOS returns Unknown
+    /// transiently during state transitions).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FlicError::BleAdapterUnavailable`] when `adapter_state()`
+    /// is `PoweredOff` (the only state we can treat as certain-bad).
+    pub async fn require_powered_on(&self) -> Result<(), FlicError> {
+        match self.adapter_state().await {
+            CentralState::PoweredOn | CentralState::Unknown => Ok(()),
+            CentralState::PoweredOff => Err(FlicError::BleAdapterUnavailable(
+                "Bluetooth is off".into(),
+            )),
+        }
+    }
+
     /// Scans for Flic 2 peripherals. Filter: advertised service UUID equals the Flic
     /// service OR the local name matches `^F2[0-9]{2}[A-Za-z0-9_-]{4}$`.
     ///
@@ -77,6 +94,7 @@ impl BleTransport {
     /// Returns [`FlicError::BleAdapterUnavailable`] if the adapter rejects the scan
     /// request or the start/stop sequence fails.
     pub async fn scan(&self, timeout: Duration) -> Result<Vec<Discovery>, FlicError> {
+        self.require_powered_on().await?;
         let filter = ScanFilter {
             services: vec![FLIC_SERVICE_UUID],
         };
@@ -196,6 +214,7 @@ impl BleTransport {
         peripheral_id_str: &str,
         timeout: Duration,
     ) -> Result<Discovery, FlicError> {
+        self.require_powered_on().await?;
         let filter = ScanFilter::default();
         self.adapter
             .start_scan(filter)

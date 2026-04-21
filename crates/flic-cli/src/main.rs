@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use flic_core::manager::{FlicEvent, FlicManager};
-use flic_core::ReconnectPolicy;
+use flic_core::{CentralState, ReconnectPolicy};
 use tokio::sync::broadcast::error::RecvError;
 use tracing::{error, info};
 
@@ -85,17 +85,23 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
 }
 
 async fn doctor() -> anyhow::Result<()> {
-    match FlicManager::new().await {
-        Ok(_) => {
-            info!("BLE adapter available");
-            println!("OK: BLE adapter available");
-            Ok(())
-        }
+    let manager = match FlicManager::new().await {
+        Ok(m) => m,
         Err(e) => {
             error!(%e, "BLE adapter unavailable");
             println!("ERROR: {e}");
             std::process::exit(1);
         }
+    };
+    let state = manager.adapter_state().await;
+    if state == CentralState::PoweredOn {
+        info!("BLE adapter powered on");
+        println!("OK: BLE adapter powered on");
+        Ok(())
+    } else {
+        error!(?state, "BLE adapter not powered on");
+        println!("ERROR: BLE adapter not powered on (state: {state:?})");
+        std::process::exit(1);
     }
 }
 

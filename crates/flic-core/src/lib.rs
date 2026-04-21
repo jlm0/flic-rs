@@ -62,3 +62,5 @@ pub use session::{
     DisconnectReason, EventResumeState, PairingCredentials, Session, SessionEvent, SessionInput,
 };
 pub use transport::{BleTransport, Discovery};
+
+pub use btleplug::api::CentralState;
