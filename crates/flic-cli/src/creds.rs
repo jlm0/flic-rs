@@ -84,9 +84,21 @@ impl StoredCreds {
 /// update leaves either the old contents or the new contents, never a
 /// truncated file.
 pub fn write_atomic(creds: &StoredCreds, path: &Path) -> anyhow::Result<()> {
-    let _ = creds;
-    let _ = path;
-    anyhow::bail!("not implemented")
+    use std::io::Write;
+
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map_or_else(|| Path::new("."), |p| p);
+
+    let json = serde_json::to_string_pretty(creds)?;
+
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+    tmp.write_all(json.as_bytes())?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(path)
+        .map_err(|e| anyhow::anyhow!("persist creds: {e}"))?;
+    Ok(())
 }
 
 /// Reads and parses a creds file.
