@@ -318,6 +318,19 @@ mod tests {
     }
 
     #[test]
+    fn backoff_elapsed_initiates_next_connect() {
+        let mut sup = Supervisor::new(ReconnectPolicy::default());
+        sup.step(SupervisorInput::Start);
+        sup.step(SupervisorInput::AttemptFailed(
+            crate::session::DisconnectReason::PingTimeout,
+        ));
+        let actions = sup.step(SupervisorInput::BackoffElapsed);
+        assert_eq!(sup.state(), SupervisorState::Connecting { attempt: 2 });
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(actions[0], SupervisorAction::InitiateConnect));
+    }
+
+    #[test]
     fn delay_respects_custom_policy() {
         let p = ReconnectPolicy {
             initial_backoff: Duration::from_millis(100),
