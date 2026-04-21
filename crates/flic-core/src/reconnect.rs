@@ -205,6 +205,13 @@ impl Supervisor {
                 self.state = SupervisorState::Connecting { attempt: 1 };
                 vec![SupervisorAction::InitiateConnect]
             }
+            (_, SupervisorInput::UserDisconnect) if self.state != SupervisorState::Stopped => {
+                self.state = SupervisorState::Stopped;
+                vec![
+                    SupervisorAction::Emit(SupervisorEvent::Stopped { final_reason: None }),
+                    SupervisorAction::Stop,
+                ]
+            }
             _ => Vec::new(),
         }
     }
