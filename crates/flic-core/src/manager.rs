@@ -397,6 +397,10 @@ async fn drive_loop(
 struct AttemptOutcome {
     reason: DisconnectReason,
     reached_established: bool,
+    /// True when the session itself emitted `FlicEvent::Disconnected` for this
+    /// outcome. Used by the supervisor to suppress a redundant final
+    /// `Disconnected` on non-retryable failures (the session is authoritative).
+    session_emitted_disconnected: bool,
 }
 
 async fn run_one_attempt(
@@ -418,6 +422,7 @@ async fn run_one_attempt(
             return Ok(AttemptOutcome {
                 reason: DisconnectReason::ByUser,
                 reached_established: false,
+                session_emitted_disconnected: false,
             });
         }
         d = find_future => d?,
@@ -482,6 +487,7 @@ async fn run_one_attempt(
     let _ = exit;
     let drive_result = drive.await;
 
+    let session_emitted_disconnected = observed_reason.is_some();
     let reason = observed_reason.unwrap_or_else(|| match drive_result {
         Ok(Ok(())) => DisconnectReason::BleTransport("drive_loop ended without reason".into()),
         Ok(Err(e)) => DisconnectReason::BleTransport(e.to_string()),
@@ -491,6 +497,7 @@ async fn run_one_attempt(
     Ok(AttemptOutcome {
         reason,
         reached_established,
+        session_emitted_disconnected,
     })
 }
 
@@ -506,6 +513,10 @@ async fn run_supervisor(
     let mut supervisor = Supervisor::new(policy);
     let mut actions = supervisor.step(SupervisorInput::Start);
     let mut pending_sleep: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
+    // When true, suppress the next `SupervisorEvent::Stopped { final_reason: Some(_) }`
+    // → `FlicEvent::Disconnected` translation because the session already emitted
+    // its own `Disconnected` for this outcome. Consumed on first matching Emit.
+    let mut suppress_final_disconnect: bool = false;
 
     // Subscribe to adapter events FIRST, then read the current state. A state
     // transition that happens between these two reads will still land on the
@@ -534,6 +545,16 @@ async fn run_supervisor(
                     pending_sleep = Some(Box::pin(tokio::time::sleep(d)));
                 }
                 SupervisorAction::Emit(evt) => {
+                    let is_final_disconnect = matches!(
+                        evt,
+                        SupervisorEvent::Stopped {
+                            final_reason: Some(_)
+                        }
+                    );
+                    if is_final_disconnect && suppress_final_disconnect {
+                        suppress_final_disconnect = false;
+                        continue;
+                    }
                     if let Some(flic_evt) = supervisor_event_to_flic(&id, evt) {
                         let _ = event_tx.send(flic_evt);
                     }
@@ -591,6 +612,7 @@ async fn run_supervisor(
                                 if outcome.reached_established {
                                     actions.append(&mut supervisor.step(SupervisorInput::AttemptSucceeded));
                                 }
+                                suppress_final_disconnect = outcome.session_emitted_disconnected;
                                 SupervisorInput::AttemptFailed(outcome.reason)
                             }
                             Err(e) => SupervisorInput::AttemptFailed(DisconnectReason::BleTransport(
