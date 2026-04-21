@@ -816,7 +816,9 @@ mod tests {
         let mut sess = Session::new();
         sess.step(SessionInput::BeginPairing).expect("ok");
         let actions = sess
-            .step(SessionInput::BleDisconnected("adapter_off".into()))
+            .step(SessionInput::BleDisconnected {
+                reason: DisconnectReason::BleTransport("adapter_off".into()),
+            })
             .expect("ok");
         assert!(matches!(
             actions[0],
@@ -825,6 +827,27 @@ mod tests {
             })
         ));
         assert!(matches!(actions[1], SessionAction::CloseSession));
+    }
+
+    #[test]
+    fn ble_disconnected_carries_ping_timeout_reason_through_to_emit() {
+        // When drive_loop decides the link is dead due to inactivity, it passes
+        // DisconnectReason::PingTimeout into the session. The session must emit
+        // that exact reason — NOT downgrade it to BleTransport — so subscribers
+        // see a single Disconnected event with the correct classification.
+        let mut sess = Session::new();
+        sess.step(SessionInput::BeginPairing).expect("ok");
+        let actions = sess
+            .step(SessionInput::BleDisconnected {
+                reason: DisconnectReason::PingTimeout,
+            })
+            .expect("ok");
+        assert!(matches!(
+            actions[0],
+            SessionAction::Emit(SessionEvent::Disconnected {
+                reason: DisconnectReason::PingTimeout
+            })
+        ));
     }
 
     #[test]
