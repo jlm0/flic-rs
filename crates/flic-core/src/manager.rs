@@ -80,6 +80,12 @@ const BROADCAST_CAPACITY: usize = 1024;
 /// gives one full missed interval plus retry slack.
 const PING_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// How long the supervisor waits for a paired peripheral to advertise during
+/// each attempt. Intentionally long — in Flic 2's Private Mode the button
+/// only advertises on a click, and a user may wait minutes between clicks.
+/// The supervisor's cancel token preempts this.
+const FIND_WINDOW: Duration = Duration::from_secs(3600);
+
 /// Single-peripheral manager. One instance handles one Flic at a time.
 pub struct FlicManager {
     transport: Arc<BleTransport>,
@@ -406,7 +412,7 @@ async fn run_one_attempt(
     // advertising is triggered by a click in Private Mode — the caller may
     // wait minutes here.
     let id_str = format!("{id}");
-    let find_future = transport.find_peripheral(&id_str, Duration::from_secs(3600));
+    let find_future = transport.find_peripheral(&id_str, FIND_WINDOW);
     let discovery = tokio::select! {
         () = cancel.cancelled() => {
             return Ok(AttemptOutcome {
@@ -521,7 +527,7 @@ async fn run_supervisor(
         for action in actions.drain(..) {
             match action {
                 SupervisorAction::InitiateConnect => {
-                    let resume = *resume_tx.subscribe().borrow();
+                    let resume = *resume_tx.borrow();
                     maybe_attempt = Some((creds.clone(), resume));
                 }
                 SupervisorAction::Sleep(d) => {

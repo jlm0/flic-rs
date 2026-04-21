@@ -257,7 +257,7 @@ fn spawn_drainer(
                 }
                 change = resume_rx.changed() => {
                     if change.is_err() {
-                        // Sender dropped — supervisor has exited. Do a final flush then return.
+                        // Sender dropped — supervisor has exited. Final flush and exit.
                         let latest = *resume_rx.borrow();
                         if latest.event_count != last_written.event_count
                             || latest.boot_id != last_written.boot_id
@@ -269,7 +269,10 @@ fn spawn_drainer(
                         }
                         return;
                     }
-                    // Value changed — the next ticker tick will write it. No immediate write.
+                    // Value advanced. Writes are owned by the ticker (intentional
+                    // 10s debounce). This arm only exists to detect sender-drop
+                    // above — we mark the change as seen and let the ticker do
+                    // the persistence.
                 }
             }
         }
