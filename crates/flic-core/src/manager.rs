@@ -501,16 +501,19 @@ async fn run_supervisor(
     let mut actions = supervisor.step(SupervisorInput::Start);
     let mut pending_sleep: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
 
-    // Check adapter state once at start; if not PoweredOn, feed AdapterPowered(false).
-    if transport.adapter_state().await != CentralState::PoweredOn {
-        actions.extend(supervisor.step(SupervisorInput::AdapterPowered(false)));
-    }
-
+    // Subscribe to adapter events FIRST, then read the current state. A state
+    // transition that happens between these two reads will still land on the
+    // stream and be processed by the main select, avoiding a lost-event window
+    // where the supervisor could wedge in the wrong state at startup.
     let mut adapter_events = transport
         .adapter()
         .events()
         .await
         .map_err(|e| FlicError::BleAdapterUnavailable(e.to_string()))?;
+
+    if transport.adapter_state().await != CentralState::PoweredOn {
+        actions.extend(supervisor.step(SupervisorInput::AdapterPowered(false)));
+    }
 
     loop {
         // Drain all queued actions first.
