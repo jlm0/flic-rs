@@ -86,6 +86,11 @@ const PING_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(20);
 /// The supervisor's cancel token preempts this.
 const FIND_WINDOW: Duration = Duration::from_secs(3600);
 
+/// Bound on best-effort courtesy writes during drive_loop shutdown (the
+/// DisconnectVerifiedLinkInd + conn.disconnect calls). A dead BLE adapter
+/// hangs these forever; we cap them so the supervisor can proceed.
+const SHUTDOWN_WRITE_BUDGET: Duration = Duration::from_millis(500);
+
 /// Single-peripheral manager. One instance handles one Flic at a time.
 pub struct FlicManager {
     transport: Arc<BleTransport>,
@@ -113,6 +118,11 @@ impl FlicManager {
     #[must_use]
     pub fn subscribe(&self) -> broadcast::Receiver<FlicEvent> {
         self.event_tx.subscribe()
+    }
+
+    /// Reads the current BLE adapter power state.
+    pub async fn adapter_state(&self) -> CentralState {
+        self.transport.adapter_state().await
     }
 
     /// Scans for Flic 2 peripherals for `timeout`.
@@ -346,6 +356,15 @@ async fn drive_loop(
             packet = notifications.next() => {
                 let Some(packet) = packet else {
                     warn!("notification stream ended");
+                    // Feed the session so subscribers see a single classified
+                    // Disconnected event rather than a silent supervisor fallback.
+                    let actions = session.step(SessionInput::BleDisconnected {
+                        reason: DisconnectReason::BleTransport("notification stream ended".into()),
+                    })?;
+                    let _ = tokio::time::timeout(
+                        SHUTDOWN_WRITE_BUDGET,
+                        apply_actions(&conn, actions, id, &event_tx, &mut no_op),
+                    ).await;
                     return Ok(());
                 };
                 debug!(bytes = packet.len(), "incoming notification");
@@ -364,7 +383,8 @@ async fn drive_loop(
                     let _ = tx.send(session.resume_state());
                 }
                 if closed {
-                    return conn.disconnect().await;
+                    let _ = tokio::time::timeout(SHUTDOWN_WRITE_BUDGET, conn.disconnect()).await;
+                    return Ok(());
                 }
             }
             () = &mut inactivity => {
@@ -377,14 +397,24 @@ async fn drive_loop(
                 let actions = session.step(SessionInput::BleDisconnected {
                     reason: DisconnectReason::PingTimeout,
                 })?;
-                apply_actions(&conn, actions, id, &event_tx, &mut no_op).await?;
-                return conn.disconnect().await;
+                let _ = tokio::time::timeout(
+                    SHUTDOWN_WRITE_BUDGET,
+                    apply_actions(&conn, actions, id, &event_tx, &mut no_op),
+                ).await;
+                let _ = tokio::time::timeout(SHUTDOWN_WRITE_BUDGET, conn.disconnect()).await;
+                return Ok(());
             }
             _ = disconnect_rx.recv() => {
                 info!("user-requested disconnect");
                 let actions = session.step(SessionInput::UserDisconnect)?;
-                apply_actions(&conn, actions, id, &event_tx, &mut no_op).await?;
-                return conn.disconnect().await;
+                // Best-effort courtesy write of DisconnectVerifiedLinkInd —
+                // bounded because a dead adapter hangs the write forever.
+                let _ = tokio::time::timeout(
+                    SHUTDOWN_WRITE_BUDGET,
+                    apply_actions(&conn, actions, id, &event_tx, &mut no_op),
+                ).await;
+                let _ = tokio::time::timeout(SHUTDOWN_WRITE_BUDGET, conn.disconnect()).await;
+                return Ok(());
             }
         }
     }
