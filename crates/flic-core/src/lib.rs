@@ -50,11 +50,15 @@ pub mod error;
 pub mod events;
 pub mod manager;
 pub mod protocol;
+pub mod reconnect;
 pub mod session;
 pub mod transport;
 
 pub use error::FlicError;
 pub use events::PressKind;
 pub use manager::FlicManager;
-pub use session::{PairingCredentials, Session, SessionEvent, SessionInput};
+pub use reconnect::ReconnectPolicy;
+pub use session::{
+    DisconnectReason, EventResumeState, PairingCredentials, Session, SessionEvent, SessionInput,
+};
 pub use transport::{BleTransport, Discovery};
