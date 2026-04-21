@@ -1,0 +1,23 @@
+{
+  "name": "flic-napi",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Node.js bindings for flic-core",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "napi": {
+    "name": "flic-napi",
+    "triples": {
+      "defaults": false,
+      "additional": ["aarch64-apple-darwin", "x86_64-apple-darwin"]
+    }
+  },
+  "scripts": {
+    "build": "napi build --platform --release",
+    "build:debug": "napi build --platform",
+    "smoke": "node smoke.mjs"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^2.18.4"
+  }
+}

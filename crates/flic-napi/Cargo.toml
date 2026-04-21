@@ -1,0 +1,23 @@
+[package]
+name = "flic-napi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Node.js bindings for flic-core"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+napi = { version = "2.16", default-features = false, features = ["napi4", "async", "tokio_rt"] }
+napi-derive = "2.16"
+flic-core = { path = "../flic-core" }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+
+[build-dependencies]
+napi-build = "2"
