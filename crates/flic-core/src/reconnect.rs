@@ -192,6 +192,19 @@ impl Supervisor {
                 };
                 vec![SupervisorAction::InitiateConnect]
             }
+            (_, SupervisorInput::AdapterPowered(false))
+                if !matches!(
+                    self.state,
+                    SupervisorState::AdapterOff | SupervisorState::Stopped
+                ) =>
+            {
+                self.state = SupervisorState::AdapterOff;
+                vec![SupervisorAction::Emit(SupervisorEvent::AdapterUnavailable)]
+            }
+            (SupervisorState::AdapterOff, SupervisorInput::AdapterPowered(true)) => {
+                self.state = SupervisorState::Connecting { attempt: 1 };
+                vec![SupervisorAction::InitiateConnect]
+            }
             _ => Vec::new(),
         }
     }
