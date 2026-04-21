@@ -47,6 +47,93 @@ pub fn delay(attempt: u32, policy: ReconnectPolicy) -> Duration {
     Duration::from_secs_f64(capped)
 }
 
+/// Inputs the supervisor reacts to. Coming from the async runner in `manager.rs`.
+#[derive(Debug, Clone)]
+pub enum SupervisorInput {
+    /// Kick off the first connect attempt.
+    Start,
+    /// The current attempt reached `SessionEstablished`.
+    AttemptSucceeded,
+    /// The current attempt ended (either connect error, handshake error, or the
+    /// live session dropped). The supervisor decides whether to retry based on
+    /// [`crate::session::DisconnectReason::is_retryable`].
+    AttemptFailed(crate::session::DisconnectReason),
+    /// The backoff timer for the current wait has elapsed.
+    BackoffElapsed,
+    /// BLE adapter powered on (`true`) or off (`false`).
+    AdapterPowered(bool),
+    /// User asked the supervisor to stop.
+    UserDisconnect,
+}
+
+/// Lifecycle events the supervisor surfaces to callers (flic-cli, napi binding).
+#[derive(Debug, Clone)]
+pub enum SupervisorEvent {
+    /// About to sleep `after`, then make `attempt`.
+    Reconnecting {
+        attempt: u32,
+        after: Duration,
+        last_reason: crate::session::DisconnectReason,
+    },
+    /// BLE adapter powered off; retries are paused until it comes back.
+    AdapterUnavailable,
+    /// Terminal — the supervisor has stopped and will not retry.
+    Stopped {
+        final_reason: Option<crate::session::DisconnectReason>,
+    },
+}
+
+/// Effectful actions the async runner performs on behalf of the pure state machine.
+#[derive(Debug, Clone)]
+pub enum SupervisorAction {
+    /// Begin a single `find → connect → listen` attempt.
+    InitiateConnect,
+    /// Park the supervisor for `Duration`; the runner must fire `BackoffElapsed`
+    /// when the timer expires.
+    Sleep(Duration),
+    /// Broadcast this lifecycle event to subscribers.
+    Emit(SupervisorEvent),
+    /// Tear down — no further inputs will be processed.
+    Stop,
+}
+
+/// Pure state of the reconnect supervisor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SupervisorState {
+    Idle,
+    Connecting { attempt: u32 },
+    Listening,
+    Backoff { next_attempt: u32 },
+    AdapterOff,
+    Stopped,
+}
+
+/// The reconnect supervisor. Pure — no I/O, no time.
+pub struct Supervisor {
+    state: SupervisorState,
+    policy: ReconnectPolicy,
+}
+
+impl Supervisor {
+    #[must_use]
+    pub fn new(policy: ReconnectPolicy) -> Self {
+        Self {
+            state: SupervisorState::Idle,
+            policy,
+        }
+    }
+
+    #[must_use]
+    pub fn state(&self) -> SupervisorState {
+        self.state
+    }
+
+    /// Apply an input and return the resulting actions.
+    pub fn step(&mut self, _input: SupervisorInput) -> Vec<SupervisorAction> {
+        unimplemented!("supervisor step is not yet implemented")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -70,6 +157,23 @@ mod tests {
         assert_eq!(delay(7, p), Duration::from_secs(30));
         // Past the cap, stays at the cap.
         assert_eq!(delay(20, p), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn start_from_idle_initiates_first_connect() {
+        let mut sup = Supervisor::new(ReconnectPolicy::default());
+        assert_eq!(sup.state(), SupervisorState::Idle);
+        let actions = sup.step(SupervisorInput::Start);
+        assert_eq!(
+            sup.state(),
+            SupervisorState::Connecting { attempt: 1 },
+            "Start must move the supervisor into Connecting on attempt 1"
+        );
+        assert_eq!(actions.len(), 1);
+        assert!(
+            matches!(actions[0], SupervisorAction::InitiateConnect),
+            "first action after Start is InitiateConnect"
+        );
     }
 
     #[test]
