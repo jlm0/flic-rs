@@ -135,6 +135,10 @@ impl Supervisor {
                 self.state = SupervisorState::Connecting { attempt: 1 };
                 vec![SupervisorAction::InitiateConnect]
             }
+            (SupervisorState::Connecting { .. }, SupervisorInput::AttemptSucceeded) => {
+                self.state = SupervisorState::Listening;
+                Vec::new()
+            }
             _ => Vec::new(),
         }
     }
