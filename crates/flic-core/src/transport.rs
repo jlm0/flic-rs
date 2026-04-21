@@ -158,83 +158,59 @@ impl BleTransport {
         })
     }
 
-    /// Starts a scan and returns the moment the target peripheral is seen (by string
-    /// match of its `PeripheralId`). Much faster than `scan(timeout)` when you already
-    /// know which peripheral you want — typically sub-second under Public Mode.
+    /// Starts an unfiltered scan and polls `adapter.peripherals()` for the target by
+    /// string-matched `PeripheralId`.
     ///
-    /// The scan is stopped on both success and timeout.
+    /// **No service-UUID filter, deliberately.** Flic 2 in Private Mode sends directed
+    /// advertisements (`ADV_DIRECT_IND`) after each click — payload doesn't include
+    /// service UUIDs. Passing a service filter makes macOS CoreBluetooth drop those
+    /// ads before btleplug sees them, so clicks look invisible. Only the undirected
+    /// Public-Mode broadcasts carry service UUIDs — filtering only works there.
+    ///
+    /// **Polling `peripherals()` instead of waiting on the event stream.** btleplug's
+    /// macOS event stream can miss the brief ad burst per click due to scan
+    /// coalescing, but the adapter's internal peripheral map does get populated —
+    /// polling it every 200ms catches what the stream misses.
+    ///
+    /// Scan is left running on success so the caller can `connect()` while the
+    /// peripheral is still live.
     ///
     /// # Errors
     ///
-    /// Returns [`FlicError::NotFound`] if the timeout elapses before the peripheral
-    /// advertises. Returns [`FlicError::BleAdapterUnavailable`] for BLE-layer failures.
+    /// Returns [`FlicError::NotFound`] on timeout without seeing the peripheral.
+    /// Returns [`FlicError::BleAdapterUnavailable`] for BLE-layer failures.
     pub async fn find_peripheral(
         &self,
         peripheral_id_str: &str,
         timeout: Duration,
     ) -> Result<Discovery, FlicError> {
-        let filter = ScanFilter {
-            services: vec![FLIC_SERVICE_UUID],
-        };
+        let filter = ScanFilter::default();
         self.adapter
             .start_scan(filter)
             .await
             .map_err(|e| FlicError::BleAdapterUnavailable(format!("start_scan: {e}")))?;
 
-        let events = self
-            .adapter
-            .events()
-            .await
-            .map_err(|e| FlicError::BleAdapterUnavailable(format!("events: {e}")))?;
-
-        // Check if the adapter already knows about it (cached from a prior scan).
-        if let Ok(peripherals) = self.adapter.peripherals().await {
-            for p in peripherals {
-                if format!("{}", p.id()) == peripheral_id_str {
-                    if let Ok(Some(props)) = p.properties().await {
-                        let _ = self.adapter.stop_scan().await;
-                        return Ok(Discovery {
-                            id: p.id(),
-                            local_name: props.local_name,
-                            rssi: props.rssi,
-                        });
-                    }
-                }
-            }
-        }
-
         let deadline = tokio::time::Instant::now() + timeout;
-        let mut events = events;
-        let result = loop {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                break Err(FlicError::NotFound);
-            }
-            match tokio::time::timeout(remaining, events.next()).await {
-                Ok(Some(CentralEvent::DeviceDiscovered(id) | CentralEvent::DeviceUpdated(id))) => {
-                    if format!("{id}") != peripheral_id_str {
-                        continue;
+        loop {
+            if let Ok(peripherals) = self.adapter.peripherals().await {
+                for p in peripherals {
+                    if format!("{}", p.id()) == peripheral_id_str {
+                        if let Ok(Some(props)) = p.properties().await {
+                            return Ok(Discovery {
+                                id: p.id(),
+                                local_name: props.local_name,
+                                rssi: props.rssi,
+                            });
+                        }
                     }
-                    let Ok(peripheral) = self.adapter.peripheral(&id).await else {
-                        continue;
-                    };
-                    let Ok(Some(props)) = peripheral.properties().await else {
-                        continue;
-                    };
-                    break Ok(Discovery {
-                        id,
-                        local_name: props.local_name,
-                        rssi: props.rssi,
-                    });
                 }
-                Ok(Some(_)) => continue,
-                Ok(None) => break Err(FlicError::Disconnected("event stream ended".into())),
-                Err(_) => break Err(FlicError::NotFound),
             }
-        };
-
-        let _ = self.adapter.stop_scan().await;
-        result
+            if tokio::time::Instant::now() >= deadline {
+                let _ = self.adapter.stop_scan().await;
+                return Err(FlicError::NotFound);
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
     }
 
     /// Watches for `CentralEvent::DeviceDisconnected` for the given peripheral.
