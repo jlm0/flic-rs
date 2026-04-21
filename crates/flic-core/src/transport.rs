@@ -78,14 +78,12 @@ impl BleTransport {
     ///
     /// # Errors
     ///
-    /// Returns [`FlicError::BleAdapterUnavailable`] when `adapter_state()`
-    /// is `PoweredOff` (the only state we can treat as certain-bad).
+    /// Returns [`FlicError::BluetoothOff`] when `adapter_state()` is
+    /// `PoweredOff` (the only state we can treat as certain-bad).
     pub async fn require_powered_on(&self) -> Result<(), FlicError> {
         match self.adapter_state().await {
             CentralState::PoweredOn | CentralState::Unknown => Ok(()),
-            CentralState::PoweredOff => Err(FlicError::BleAdapterUnavailable(
-                "Bluetooth is off".into(),
-            )),
+            CentralState::PoweredOff => Err(FlicError::BluetoothOff),
         }
     }
 
