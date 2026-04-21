@@ -347,7 +347,7 @@ fn print_event(event: &FlicEvent) {
         } => {
             println!(
                 "[{}] Connected — battery={battery_voltage_mv}mV fw={firmware_version}",
-                short_id(&format!("{id}"))
+                short_id(id)
             );
         }
         FlicEvent::EventsResumed {
@@ -358,7 +358,7 @@ fn print_event(event: &FlicEvent) {
         } => {
             println!(
                 "[{}] EventsResumed — count={event_count} boot_id={boot_id} queued={has_queued_events}",
-                short_id(&format!("{id}"))
+                short_id(id)
             );
         }
         FlicEvent::ButtonPressed {
@@ -369,12 +369,12 @@ fn print_event(event: &FlicEvent) {
         } => {
             println!(
                 "[{}] {kind:?} ts={timestamp_32k}{}",
-                short_id(&format!("{id}")),
+                short_id(id),
                 if *was_queued { " (queued)" } else { "" }
             );
         }
         FlicEvent::Disconnected { id, reason } => {
-            println!("[{}] Disconnected: {reason:?}", short_id(&format!("{id}")));
+            println!("[{}] Disconnected: {reason:?}", short_id(id));
         }
         FlicEvent::Reconnecting {
             id,
@@ -384,14 +384,14 @@ fn print_event(event: &FlicEvent) {
         } => {
             println!(
                 "[{}] Reconnecting in {:.1}s (attempt {attempt}) after {last_reason:?}",
-                short_id(&format!("{id}")),
+                short_id(id),
                 after.as_secs_f32()
             );
         }
         FlicEvent::AdapterUnavailable { id } => {
             println!(
                 "[{}] Adapter unavailable — waiting for Bluetooth",
-                short_id(&format!("{id}"))
+                short_id(id)
             );
         }
     }

@@ -19,7 +19,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use btleplug::api::{Central, CentralEvent, CentralState};
-use btleplug::platform::PeripheralId;
 use futures::stream::StreamExt;
 use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
@@ -38,38 +37,42 @@ use crate::session::{
 use crate::transport::{BleConnection, BleTransport, Discovery};
 
 /// Events broadcast to consumers of [`FlicManager::listen`].
+///
+/// `id` is the opaque peripheral identifier string originally returned from
+/// [`FlicManager::scan`] / [`FlicManager::find`]. Treat it as a stable handle
+/// for the paired button.
 #[derive(Debug, Clone)]
 pub enum FlicEvent {
     Connected {
-        id: PeripheralId,
+        id: String,
         battery_voltage_mv: u16,
         firmware_version: u32,
     },
     ButtonPressed {
-        id: PeripheralId,
+        id: String,
         kind: crate::PressKind,
         timestamp_32k: u64,
         was_queued: bool,
     },
     EventsResumed {
-        id: PeripheralId,
+        id: String,
         event_count: u32,
         boot_id: u32,
         has_queued_events: bool,
     },
     Disconnected {
-        id: PeripheralId,
+        id: String,
         reason: DisconnectReason,
     },
     /// Reconnect supervisor is about to sleep `after` then make `attempt`.
     Reconnecting {
-        id: PeripheralId,
+        id: String,
         attempt: u32,
         after: Duration,
         last_reason: DisconnectReason,
     },
     /// BLE adapter powered off — retries paused until it returns.
-    AdapterUnavailable { id: PeripheralId },
+    AdapterUnavailable { id: String },
 }
 
 const BROADCAST_CAPACITY: usize = 1024;
@@ -158,7 +161,7 @@ impl FlicManager {
     /// # Errors
     ///
     /// Returns [`FlicError::PairingFailed`] if the handshake fails for any reason.
-    pub async fn pair(&self, id: &PeripheralId) -> Result<PairingCredentials, FlicError> {
+    pub async fn pair(&self, id: &str) -> Result<PairingCredentials, FlicError> {
         let conn = self.transport.connect(id).await?;
         let mut session = Session::new();
         let mut creds: Option<PairingCredentials> = None;
@@ -195,7 +198,7 @@ impl FlicManager {
     /// Returns any error from the transport or session.
     pub async fn listen(
         &self,
-        id: PeripheralId,
+        id: String,
         creds: PairingCredentials,
         resume: EventResumeState,
     ) -> Result<ListenHandle, FlicError> {
@@ -243,7 +246,7 @@ impl FlicManager {
     #[allow(clippy::unused_async)] // async signature kept for symmetry with `listen`.
     pub async fn listen_with_reconnect(
         &self,
-        id: PeripheralId,
+        id: String,
         creds: PairingCredentials,
         initial_resume: EventResumeState,
         policy: ReconnectPolicy,
@@ -337,12 +340,12 @@ async fn drive_loop(
     mut session: Session,
     conn: BleConnection,
     initial: Vec<SessionAction>,
-    id: &PeripheralId,
+    id: &str,
     event_tx: broadcast::Sender<FlicEvent>,
     disconnect_rx: &mut tokio::sync::mpsc::Receiver<()>,
     resume_tx: Option<watch::Sender<EventResumeState>>,
 ) -> Result<(), FlicError> {
-    let mut no_op = |_: &PeripheralId, _: &SessionEvent| {};
+    let mut no_op = |_: &str, _: &SessionEvent| {};
     let closed = apply_actions(&conn, initial, id, &event_tx, &mut no_op).await?;
     if closed {
         return conn.disconnect().await;
@@ -435,7 +438,7 @@ struct AttemptOutcome {
 
 async fn run_one_attempt(
     transport: &BleTransport,
-    id: &PeripheralId,
+    id: &str,
     creds: PairingCredentials,
     resume: EventResumeState,
     event_tx: broadcast::Sender<FlicEvent>,
@@ -445,8 +448,7 @@ async fn run_one_attempt(
     // Scan until the peripheral advertises (or the cancel fires). Flic 2's
     // advertising is triggered by a click in Private Mode — the caller may
     // wait minutes here.
-    let id_str = format!("{id}");
-    let find_future = transport.find_peripheral(&id_str, FIND_WINDOW);
+    let find_future = transport.find_peripheral(id, FIND_WINDOW);
     let discovery = tokio::select! {
         () = cancel.cancelled() => {
             return Ok(AttemptOutcome {
@@ -469,7 +471,7 @@ async fn run_one_attempt(
 
     let drive = {
         let event_tx = event_tx.clone();
-        let id = id.clone();
+        let id = id.to_string();
         let resume_tx = resume_tx.clone();
         tokio::spawn(async move {
             drive_loop(
@@ -497,13 +499,13 @@ async fn run_one_attempt(
             }
             evt = rx.recv() => {
                 match evt {
-                    Ok(FlicEvent::Connected { id: eid, .. }) if &eid == id => {
+                    Ok(FlicEvent::Connected { id: eid, .. }) if eid == id => {
                         reached_established = true;
                     }
-                    Ok(FlicEvent::EventsResumed { id: eid, .. }) if &eid == id => {
+                    Ok(FlicEvent::EventsResumed { id: eid, .. }) if eid == id => {
                         reached_established = true;
                     }
-                    Ok(FlicEvent::Disconnected { id: eid, reason }) if &eid == id => {
+                    Ok(FlicEvent::Disconnected { id: eid, reason }) if eid == id => {
                         observed_reason = Some(reason);
                         break Ok(());
                     }
@@ -533,7 +535,7 @@ async fn run_one_attempt(
 
 async fn run_supervisor(
     transport: Arc<BleTransport>,
-    id: PeripheralId,
+    id: String,
     creds: PairingCredentials,
     resume_tx: watch::Sender<EventResumeState>,
     event_tx: broadcast::Sender<FlicEvent>,
@@ -694,27 +696,29 @@ async fn run_supervisor(
     }
 }
 
-fn supervisor_event_to_flic(id: &PeripheralId, evt: SupervisorEvent) -> Option<FlicEvent> {
+fn supervisor_event_to_flic(id: &str, evt: SupervisorEvent) -> Option<FlicEvent> {
     match evt {
         SupervisorEvent::Reconnecting {
             attempt,
             after,
             last_reason,
         } => Some(FlicEvent::Reconnecting {
-            id: id.clone(),
+            id: id.to_string(),
             attempt,
             after,
             last_reason,
         }),
-        SupervisorEvent::AdapterUnavailable => Some(FlicEvent::AdapterUnavailable { id: id.clone() }),
+        SupervisorEvent::AdapterUnavailable => Some(FlicEvent::AdapterUnavailable {
+            id: id.to_string(),
+        }),
         SupervisorEvent::Stopped {
             final_reason: Some(reason),
         } => Some(FlicEvent::Disconnected {
-            id: id.clone(),
+            id: id.to_string(),
             reason,
         }),
         SupervisorEvent::Stopped { final_reason: None } => Some(FlicEvent::Disconnected {
-            id: id.clone(),
+            id: id.to_string(),
             reason: DisconnectReason::ByUser,
         }),
     }
@@ -723,9 +727,9 @@ fn supervisor_event_to_flic(id: &PeripheralId, evt: SupervisorEvent) -> Option<F
 async fn apply_actions(
     conn: &BleConnection,
     actions: Vec<SessionAction>,
-    id: &PeripheralId,
+    id: &str,
     event_tx: &broadcast::Sender<FlicEvent>,
-    on_event: &mut impl FnMut(&PeripheralId, &SessionEvent),
+    on_event: &mut impl FnMut(&str, &SessionEvent),
 ) -> Result<bool, FlicError> {
     let mut closed = false;
     for action in actions {
@@ -748,10 +752,10 @@ async fn apply_actions(
 
 fn broadcast_event(
     event_tx: &broadcast::Sender<FlicEvent>,
-    id: &PeripheralId,
+    id: &str,
     event: &SessionEvent,
 ) {
-    let id = id.clone();
+    let id = id.to_string();
     let broadcast = match event {
         SessionEvent::Paired(_) => None, // Paired is returned to caller directly.
         SessionEvent::Connected {

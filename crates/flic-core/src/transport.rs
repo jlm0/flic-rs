@@ -8,19 +8,22 @@
 use std::time::Duration;
 
 use btleplug::api::{
-    Central, CentralEvent, CentralState, Manager as _, Peripheral as _, ScanFilter, WriteType,
+    Central, CentralState, Manager as _, Peripheral as _, ScanFilter, WriteType,
 };
-use btleplug::platform::{Adapter, Manager, Peripheral, PeripheralId};
+use btleplug::platform::{Adapter, Manager, Peripheral};
 use futures::stream::StreamExt;
 use tracing::info;
 
 use crate::constants::{FLIC_NOTIFY_CHAR_UUID, FLIC_SERVICE_UUID, FLIC_WRITE_CHAR_UUID};
 use crate::error::FlicError;
 
-/// A Flic peripheral discovered by a scan.
+/// A Flic peripheral discovered by a scan. `id` is the platform-specific
+/// peripheral identifier rendered as a string (a UUID on macOS, a BlueZ path
+/// on Linux). Treat it as opaque — pass it back into [`FlicManager::pair`] or
+/// [`FlicManager::listen_with_reconnect`] as-is.
 #[derive(Debug, Clone)]
 pub struct Discovery {
-    pub id: PeripheralId,
+    pub id: String,
     pub local_name: Option<String>,
     pub rssi: Option<i16>,
 }
@@ -126,7 +129,7 @@ impl BleTransport {
             let name_matches = local_name.as_deref().is_some_and(is_flic_local_name);
             if advertises_flic || name_matches {
                 results.push(Discovery {
-                    id: p.id(),
+                    id: p.id().to_string(),
                     local_name,
                     rssi: props.rssi,
                 });
@@ -135,20 +138,27 @@ impl BleTransport {
         Ok(results)
     }
 
-    /// Connects to a peripheral by ID, performs GATT discovery, and subscribes to the
-    /// Flic notify characteristic. Returns an open [`BleConnection`] ready to write
-    /// and read frames.
+    /// Connects to a peripheral by string ID (as returned from [`Discovery::id`]),
+    /// performs GATT discovery, and subscribes to the Flic notify characteristic.
+    /// Returns an open [`BleConnection`] ready to write and read frames.
+    ///
+    /// The peripheral must already be known to the adapter (i.e. a scan has seen
+    /// it in the current power cycle); this function does not scan.
     ///
     /// # Errors
     ///
     /// Returns [`FlicError::NotFound`] if the peripheral isn't known to the adapter,
     /// or [`FlicError::BleAdapterUnavailable`] for any BLE-layer failure.
-    pub async fn connect(&self, id: &PeripheralId) -> Result<BleConnection, FlicError> {
-        let peripheral = self
+    pub async fn connect(&self, id: &str) -> Result<BleConnection, FlicError> {
+        let peripherals = self
             .adapter
-            .peripheral(id)
+            .peripherals()
             .await
-            .map_err(|_| FlicError::NotFound)?;
+            .map_err(|e| FlicError::BleAdapterUnavailable(e.to_string()))?;
+        let peripheral = peripherals
+            .into_iter()
+            .find(|p| p.id().to_string() == id)
+            .ok_or(FlicError::NotFound)?;
 
         if !peripheral.is_connected().await.unwrap_or(false) {
             peripheral
@@ -179,7 +189,7 @@ impl BleTransport {
             .await
             .map_err(|e| FlicError::BleAdapterUnavailable(format!("subscribe: {e}")))?;
 
-        info!(peripheral = ?id, "Flic GATT session open");
+        info!(peripheral = id, "Flic GATT session open");
 
         Ok(BleConnection {
             peripheral,
@@ -188,8 +198,8 @@ impl BleTransport {
         })
     }
 
-    /// Starts an unfiltered scan and polls `adapter.peripherals()` for the target by
-    /// string-matched `PeripheralId`.
+    /// Starts an unfiltered scan and polls `adapter.peripherals()` for the target,
+    /// matching the stringified peripheral id.
     ///
     /// **No service-UUID filter, deliberately.** Flic 2 in Private Mode sends directed
     /// advertisements (`ADV_DIRECT_IND`) after each click — payload doesn't include
@@ -225,10 +235,10 @@ impl BleTransport {
         loop {
             if let Ok(peripherals) = self.adapter.peripherals().await {
                 for p in peripherals {
-                    if format!("{}", p.id()) == peripheral_id_str {
+                    if p.id().to_string() == peripheral_id_str {
                         if let Ok(Some(props)) = p.properties().await {
                             return Ok(Discovery {
-                                id: p.id(),
+                                id: p.id().to_string(),
                                 local_name: props.local_name,
                                 rssi: props.rssi,
                             });
@@ -244,28 +254,6 @@ impl BleTransport {
         }
     }
 
-    /// Watches for `CentralEvent::DeviceDisconnected` for the given peripheral.
-    /// Returns when the event arrives; the caller should close the session.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`FlicError::BleAdapterUnavailable`] if the event stream can't be
-    /// obtained.
-    pub async fn watch_disconnect(&self, id: &PeripheralId) -> Result<(), FlicError> {
-        let mut events = self
-            .adapter
-            .events()
-            .await
-            .map_err(|e| FlicError::BleAdapterUnavailable(e.to_string()))?;
-        while let Some(evt) = events.next().await {
-            if let CentralEvent::DeviceDisconnected(pid) = evt {
-                if &pid == id {
-                    return Ok(());
-                }
-            }
-        }
-        Err(FlicError::Disconnected("event stream ended".into()))
-    }
 }
 
 /// Active GATT connection to one Flic. Owns the btleplug peripheral handle + char refs.
@@ -331,8 +319,8 @@ impl BleConnection {
     }
 
     #[must_use]
-    pub fn id(&self) -> PeripheralId {
-        self.peripheral.id()
+    pub fn id(&self) -> String {
+        self.peripheral.id().to_string()
     }
 }
 
