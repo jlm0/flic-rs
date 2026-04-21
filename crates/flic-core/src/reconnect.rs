@@ -139,6 +139,21 @@ impl Supervisor {
                 self.state = SupervisorState::Listening;
                 Vec::new()
             }
+            (SupervisorState::Connecting { attempt }, SupervisorInput::AttemptFailed(reason))
+                if reason.is_retryable() =>
+            {
+                let after = delay(attempt, self.policy);
+                let next_attempt = attempt + 1;
+                self.state = SupervisorState::Backoff { next_attempt };
+                vec![
+                    SupervisorAction::Emit(SupervisorEvent::Reconnecting {
+                        attempt: next_attempt,
+                        after,
+                        last_reason: reason,
+                    }),
+                    SupervisorAction::Sleep(after),
+                ]
+            }
             _ => Vec::new(),
         }
     }
