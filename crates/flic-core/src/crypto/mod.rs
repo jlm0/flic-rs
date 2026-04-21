@@ -14,3 +14,4 @@
 pub mod chaskey;
 pub mod ed25519;
 pub mod kdf;
+pub mod x25519;
