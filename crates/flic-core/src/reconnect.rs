@@ -199,6 +199,36 @@ mod tests {
     }
 
     #[test]
+    fn retryable_failure_from_connecting_schedules_backoff() {
+        let mut sup = Supervisor::new(ReconnectPolicy::default());
+        sup.step(SupervisorInput::Start);
+        let actions = sup.step(SupervisorInput::AttemptFailed(
+            crate::session::DisconnectReason::PingTimeout,
+        ));
+        assert_eq!(sup.state(), SupervisorState::Backoff { next_attempt: 2 });
+        assert_eq!(actions.len(), 2, "emit Reconnecting + Sleep");
+        match &actions[0] {
+            SupervisorAction::Emit(SupervisorEvent::Reconnecting {
+                attempt,
+                after,
+                last_reason,
+            }) => {
+                assert_eq!(*attempt, 2);
+                assert_eq!(*after, Duration::from_millis(500));
+                assert!(matches!(
+                    last_reason,
+                    crate::session::DisconnectReason::PingTimeout
+                ));
+            }
+            other => panic!("expected Reconnecting, got {other:?}"),
+        }
+        assert!(matches!(
+            actions[1],
+            SupervisorAction::Sleep(d) if d == Duration::from_millis(500)
+        ));
+    }
+
+    #[test]
     fn delay_respects_custom_policy() {
         let p = ReconnectPolicy {
             initial_backoff: Duration::from_millis(100),
