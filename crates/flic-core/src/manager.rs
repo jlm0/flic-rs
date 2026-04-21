@@ -56,6 +56,12 @@ pub enum FlicEvent {
 
 const BROADCAST_CAPACITY: usize = 1024;
 
+/// How long `drive_loop` waits for *any* inbound notification before declaring
+/// the link dead. Any traffic — PING, ButtonEventNotification, a random
+/// unhandled opcode — resets the timer. Flic 2's idle heartbeat is ~10s; 20s
+/// gives one full missed interval plus retry slack.
+const PING_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// Single-peripheral manager. One instance handles one Flic at a time.
 pub struct FlicManager {
     transport: BleTransport,
@@ -225,6 +231,7 @@ async fn drive_loop(
     }
 
     let mut notifications = conn.notifications().await?;
+    let mut inactivity = Box::pin(tokio::time::sleep(PING_INACTIVITY_TIMEOUT));
 
     loop {
         tokio::select! {
@@ -234,6 +241,9 @@ async fn drive_loop(
                     return Ok(());
                 };
                 debug!(bytes = packet.len(), "incoming notification");
+                inactivity
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + PING_INACTIVITY_TIMEOUT);
                 let actions = match session.step(SessionInput::IncomingPacket(packet)) {
                     Ok(a) => a,
                     Err(e) => {
@@ -245,6 +255,23 @@ async fn drive_loop(
                 if closed {
                     return conn.disconnect().await;
                 }
+            }
+            () = &mut inactivity => {
+                warn!(
+                    timeout_secs = PING_INACTIVITY_TIMEOUT.as_secs(),
+                    "no BLE traffic for inactivity window — declaring link dead"
+                );
+                // Drive the session into BleDisconnected so it emits the right
+                // terminal events, then map that to DisconnectReason::PingTimeout
+                // for subscribers (BleDisconnected produces BleTransport by default).
+                let _ = session.step(SessionInput::BleDisconnected("ping_inactivity".into()))?;
+                // Override what the session would have broadcast: the real reason
+                // is PingTimeout so the reconnect supervisor classifies it correctly.
+                let _ = event_tx.send(FlicEvent::Disconnected {
+                    id: id.clone(),
+                    reason: crate::session::DisconnectReason::PingTimeout,
+                });
+                return conn.disconnect().await;
             }
             _ = disconnect_rx.recv() => {
                 info!("user-requested disconnect");
