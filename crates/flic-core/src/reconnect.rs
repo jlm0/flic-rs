@@ -420,6 +420,34 @@ mod tests {
     }
 
     #[test]
+    fn stopped_absorbs_all_further_inputs() {
+        // Once the supervisor has stopped — whether by fatal failure or by user —
+        // no further inputs should produce actions or state changes. Late-arriving
+        // events from racing async tasks must be safe to feed in.
+        let mut sup = Supervisor::new(ReconnectPolicy::default());
+        sup.step(SupervisorInput::Start);
+        sup.step(SupervisorInput::UserDisconnect);
+        assert_eq!(sup.state(), SupervisorState::Stopped);
+
+        for input in [
+            SupervisorInput::Start,
+            SupervisorInput::AttemptSucceeded,
+            SupervisorInput::AttemptFailed(crate::session::DisconnectReason::PingTimeout),
+            SupervisorInput::BackoffElapsed,
+            SupervisorInput::AdapterPowered(false),
+            SupervisorInput::AdapterPowered(true),
+            SupervisorInput::UserDisconnect,
+        ] {
+            let actions = sup.step(input);
+            assert_eq!(sup.state(), SupervisorState::Stopped);
+            assert!(
+                actions.is_empty(),
+                "Stopped must be absorbing for all inputs"
+            );
+        }
+    }
+
+    #[test]
     fn delay_respects_custom_policy() {
         let p = ReconnectPolicy {
             initial_backoff: Duration::from_millis(100),
