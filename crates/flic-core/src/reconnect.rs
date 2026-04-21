@@ -154,6 +154,15 @@ impl Supervisor {
                     SupervisorAction::Sleep(after),
                 ]
             }
+            (SupervisorState::Connecting { .. }, SupervisorInput::AttemptFailed(reason)) => {
+                self.state = SupervisorState::Stopped;
+                vec![
+                    SupervisorAction::Emit(SupervisorEvent::Stopped {
+                        final_reason: Some(reason),
+                    }),
+                    SupervisorAction::Stop,
+                ]
+            }
             _ => Vec::new(),
         }
     }
