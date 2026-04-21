@@ -1,15 +1,38 @@
-// Smoke test: load the .node from a plain Node context and exercise the
-// `version()` export. Proves the binding builds + loads end-to-end before
-// we add the real surface (FlicManager, event stream, commands).
+// Smoke test for flic-napi. Runs under plain Node; exercises every
+// no-hardware-required entry point. Hardware tests (pair/connect/press)
+// live in hardware-smoke.mjs and need a button.
 
-import { version } from './index.js';
+import { FlicManager, AdapterState, version } from './index.js';
 
-const reported = version();
-console.log(`flic-napi loaded. version=${reported}`);
+function assert(cond, msg) {
+  if (!cond) {
+    console.error(`FAIL: ${msg}`);
+    process.exit(1);
+  }
+}
 
-if (typeof reported !== 'string' || reported.length === 0) {
-  console.error('FAIL: version() returned non-string or empty');
-  process.exit(1);
+console.log(`version=${version()}`);
+
+const manager = await FlicManager.create();
+console.log('FlicManager created');
+
+const state = await manager.adapterState();
+console.log(`adapterState=${state}`);
+assert(
+  state === AdapterState.PoweredOn ||
+    state === AdapterState.PoweredOff ||
+    state === AdapterState.Unknown,
+  `adapterState returned unexpected value: ${state}`,
+);
+
+// Short scan — we don't expect any Public-Mode Flics, but the call should
+// succeed and return an array without throwing.
+const scanned = await manager.scan(2000);
+console.log(`scan returned ${scanned.length} peripheral(s)`);
+assert(Array.isArray(scanned), 'scan did not return an array');
+for (const d of scanned) {
+  assert(typeof d.id === 'string', 'Discovery.id is not a string');
+  console.log(`  ${d.id} rssi=${d.rssi ?? 'none'} name=${d.localName ?? 'none'}`);
 }
 
 console.log('OK');
