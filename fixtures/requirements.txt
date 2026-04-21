@@ -1,0 +1,2 @@
+pyflic-ble>=0.1
+cryptography>=41

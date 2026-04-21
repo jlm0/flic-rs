@@ -1,0 +1,11 @@
+{"counter": 0, "data": "08", "direction": 0, "key": "0123456789abcdef0123456789abcdef", "mac": "cddb12cc14"}
+{"counter": 0, "data": "08", "direction": 1, "key": "0123456789abcdef0123456789abcdef", "mac": "db5db95efa"}
+{"counter": 1, "data": "08", "direction": 0, "key": "0123456789abcdef0123456789abcdef", "mac": "5c401d4f2f"}
+{"counter": 4294967295, "data": "08", "direction": 0, "key": "0123456789abcdef0123456789abcdef", "mac": "ad0bf66903"}
+{"counter": 4294967296, "data": "08", "direction": 0, "key": "0123456789abcdef0123456789abcdef", "mac": "aa500b3d34"}
+{"counter": 42, "data": "17000000000000000000000000", "direction": 0, "key": "0123456789abcdef0123456789abcdef", "mac": "1169f8fd2f"}
+{"counter": 42, "data": "17000000000000000000000000000000", "direction": 1, "key": "0123456789abcdef0123456789abcdef", "mac": "4109a67cd1"}
+{"counter": 42, "data": "1700000000000000000000000000000000", "direction": 0, "key": "0123456789abcdef0123456789abcdef", "mac": "d886f093f0"}
+{"counter": 42, "data": "170000000000000000000000000000000000000000000000000000000000000000", "direction": 0, "key": "0123456789abcdef0123456789abcdef", "mac": "b25ec7922d"}
+{"counter": 42, "data": "170000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000", "direction": 1, "key": "0123456789abcdef0123456789abcdef", "mac": "16e0afb85f"}
+{"counter": 42, "data": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", "direction": 0, "key": "0123456789abcdef0123456789abcdef", "mac": "de3ca1b50a"}

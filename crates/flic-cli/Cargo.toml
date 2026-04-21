@@ -1,0 +1,23 @@
+[package]
+name = "flic-cli"
+description = "Command-line diagnostic + validation harness for flic-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "flic-cli"
+path = "src/main.rs"
+
+[dependencies]
+flic-core = { path = "../flic-core" }
+tokio = { workspace = true, features = ["signal"] }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
