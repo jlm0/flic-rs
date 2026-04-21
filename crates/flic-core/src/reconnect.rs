@@ -271,6 +271,30 @@ mod tests {
     }
 
     #[test]
+    fn retryable_failure_from_listening_resets_attempt_to_one() {
+        // If we've held a good session and then lose it, start backoff at attempt 1
+        // — the previous connect succeeded, so the accumulated attempt count is
+        // stale. A burned-through 30s cap on every future drop is not what we want.
+        let mut sup = Supervisor::new(ReconnectPolicy::default());
+        sup.step(SupervisorInput::Start);
+        sup.step(SupervisorInput::AttemptSucceeded);
+        assert_eq!(sup.state(), SupervisorState::Listening);
+        let actions = sup.step(SupervisorInput::AttemptFailed(
+            crate::session::DisconnectReason::PingTimeout,
+        ));
+        assert_eq!(sup.state(), SupervisorState::Backoff { next_attempt: 2 });
+        match &actions[0] {
+            SupervisorAction::Emit(SupervisorEvent::Reconnecting {
+                attempt, after, ..
+            }) => {
+                assert_eq!(*attempt, 2);
+                assert_eq!(*after, Duration::from_millis(500), "delay(1) not delay(N)");
+            }
+            other => panic!("expected Reconnecting, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn delay_respects_custom_policy() {
         let p = ReconnectPolicy {
             initial_backoff: Duration::from_millis(100),
