@@ -67,8 +67,10 @@ pub enum SessionInput {
     IncomingPacket(Vec<u8>),
     /// Caller requested a clean disconnect.
     UserDisconnect,
-    /// Underlying BLE transport dropped the link.
-    BleDisconnected(String),
+    /// Underlying BLE transport dropped the link. The caller supplies the
+    /// `DisconnectReason` so subscribers see a single, correctly-classified
+    /// `Disconnected` event (e.g. `PingTimeout` vs generic `BleTransport`).
+    BleDisconnected { reason: DisconnectReason },
 }
 
 /// High-level events surfaced to the caller.
@@ -231,12 +233,10 @@ impl Session {
             SessionInput::BeginReconnect(creds, resume) => self.begin_reconnect(creds, resume),
             SessionInput::IncomingPacket(packet) => self.on_packet(&packet),
             SessionInput::UserDisconnect => self.on_user_disconnect(),
-            SessionInput::BleDisconnected(reason) => {
+            SessionInput::BleDisconnected { reason } => {
                 let mut actions = Vec::new();
                 if self.state != State::Failed && self.state != State::Disconnected {
-                    actions.push(SessionAction::Emit(SessionEvent::Disconnected {
-                        reason: DisconnectReason::BleTransport(reason),
-                    }));
+                    actions.push(SessionAction::Emit(SessionEvent::Disconnected { reason }));
                 }
                 self.state = State::Failed;
                 actions.push(SessionAction::CloseSession);

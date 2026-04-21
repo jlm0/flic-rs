@@ -366,16 +366,12 @@ async fn drive_loop(
                     timeout_secs = PING_INACTIVITY_TIMEOUT.as_secs(),
                     "no BLE traffic for inactivity window — declaring link dead"
                 );
-                // Drive the session into BleDisconnected so it emits the right
-                // terminal events, then map that to DisconnectReason::PingTimeout
-                // for subscribers (BleDisconnected produces BleTransport by default).
-                let _ = session.step(SessionInput::BleDisconnected("ping_inactivity".into()))?;
-                // Override what the session would have broadcast: the real reason
-                // is PingTimeout so the reconnect supervisor classifies it correctly.
-                let _ = event_tx.send(FlicEvent::Disconnected {
-                    id: id.clone(),
-                    reason: crate::session::DisconnectReason::PingTimeout,
-                });
+                // The session emits Disconnected with exactly this reason —
+                // one event, correctly classified, no manual override needed.
+                let actions = session.step(SessionInput::BleDisconnected {
+                    reason: DisconnectReason::PingTimeout,
+                })?;
+                apply_actions(&conn, actions, id, &event_tx, &mut no_op).await?;
                 return conn.disconnect().await;
             }
             _ = disconnect_rx.recv() => {
