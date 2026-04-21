@@ -196,6 +196,19 @@ impl Session {
         }
     }
 
+    /// Returns the event-continuity values the session currently knows about.
+    /// Callers persist this across reconnects so the button can suppress events
+    /// already delivered on a previous session.
+    ///
+    /// Returns `EventResumeState::default()` before any reconnect is started.
+    /// Updated when `BeginReconnect` supplies resume values, when
+    /// `InitButtonEventsResponseWithBootId` lands, and after each ACK we emit for
+    /// a `ButtonEventNotification`.
+    #[must_use]
+    pub fn resume_state(&self) -> EventResumeState {
+        self.event_resume
+    }
+
     /// Apply an input and return the resulting actions.
     pub fn step(&mut self, input: SessionInput) -> Result<Vec<SessionAction>, FlicError> {
         match input {
