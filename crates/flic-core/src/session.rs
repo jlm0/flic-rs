@@ -807,6 +807,35 @@ mod tests {
     }
 
     #[test]
+    fn resume_state_defaults_to_zero_before_reconnect() {
+        let sess = Session::new();
+        let state = sess.resume_state();
+        assert_eq!(state.event_count, 0);
+        assert_eq!(state.boot_id, 0);
+    }
+
+    #[test]
+    fn resume_state_reflects_values_supplied_on_begin_reconnect() {
+        let mut sess = Session::new();
+        let creds = PairingCredentials {
+            pairing_id: 0x1234_5678,
+            pairing_key: [0x11; 16],
+            serial_number: "BC00-A00001".into(),
+            button_uuid: [0x22; 16],
+            firmware_version: 7,
+        };
+        let resume = EventResumeState {
+            event_count: 147,
+            boot_id: 3,
+        };
+        sess.step(SessionInput::BeginReconnect(creds, resume))
+            .expect("ok");
+        let state = sess.resume_state();
+        assert_eq!(state.event_count, 147);
+        assert_eq!(state.boot_id, 3);
+    }
+
+    #[test]
     fn is_retryable_classifies_every_disconnect_reason() {
         // Transient link-layer problems — the button is still ours, just re-handshake.
         assert!(DisconnectReason::PingTimeout.is_retryable());
