@@ -19,3 +19,9 @@ fixtures/*.pyc
 
 # Local tools
 *.local
+
+# Flic pairing credentials — contain the 16-byte pairing_key and the host-specific
+# peripheral UUID. Must never be checked in.
+creds.json
+*.creds.json
+*-creds.json
