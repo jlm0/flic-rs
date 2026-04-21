@@ -186,6 +186,12 @@ impl Supervisor {
                     SupervisorAction::Stop,
                 ]
             }
+            (SupervisorState::Backoff { next_attempt }, SupervisorInput::BackoffElapsed) => {
+                self.state = SupervisorState::Connecting {
+                    attempt: next_attempt,
+                };
+                vec![SupervisorAction::InitiateConnect]
+            }
             _ => Vec::new(),
         }
     }
