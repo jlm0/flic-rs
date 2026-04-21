@@ -36,8 +36,15 @@ impl Default for ReconnectPolicy {
 /// Delay to wait before attempt number `attempt` (1-indexed: attempt=1 is the
 /// first retry, right after the initial connect failed).
 #[must_use]
-pub fn delay(_attempt: u32, _policy: ReconnectPolicy) -> Duration {
-    unimplemented!("delay is not yet implemented")
+pub fn delay(attempt: u32, policy: ReconnectPolicy) -> Duration {
+    if attempt == 0 {
+        return Duration::ZERO;
+    }
+    let base = policy.initial_backoff.as_secs_f64();
+    let mult = f64::from(policy.multiplier);
+    let raw = base * mult.powi((attempt - 1) as i32);
+    let capped = raw.min(policy.max_backoff.as_secs_f64());
+    Duration::from_secs_f64(capped)
 }
 
 #[cfg(test)]
