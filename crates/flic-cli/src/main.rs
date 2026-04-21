@@ -20,6 +20,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast::error::RecvError;
 use tracing::{error, info};
 
+mod creds;
+
 #[derive(Parser)]
 #[command(name = "flic-cli")]
 #[command(about = "Diagnostic harness for the flic-core Flic 2 implementation")]
