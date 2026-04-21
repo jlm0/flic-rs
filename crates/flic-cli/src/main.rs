@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use flic_core::manager::{FlicEvent, FlicManager};
-use flic_core::{CentralState, ReconnectPolicy};
+use flic_core::{AdapterState, ReconnectPolicy};
 use tokio::sync::broadcast::error::RecvError;
 use tracing::{error, info};
 
@@ -105,7 +105,7 @@ async fn doctor() -> anyhow::Result<()> {
         }
     };
     let state = manager.adapter_state().await;
-    if state == CentralState::PoweredOn {
+    if state == AdapterState::PoweredOn {
         info!("BLE adapter powered on");
         println!("OK: BLE adapter powered on");
         Ok(())
@@ -379,13 +379,13 @@ fn print_event(event: &FlicEvent) {
         FlicEvent::Reconnecting {
             id,
             attempt,
-            after,
+            after_millis,
             last_reason,
         } => {
             println!(
                 "[{}] Reconnecting in {:.1}s (attempt {attempt}) after {last_reason:?}",
                 short_id(id),
-                after.as_secs_f32()
+                *after_millis as f32 / 1000.0
             );
         }
         FlicEvent::AdapterUnavailable { id } => {

@@ -56,11 +56,9 @@ pub mod transport;
 
 pub use error::FlicError;
 pub use events::PressKind;
-pub use manager::FlicManager;
+pub use manager::{AdapterState, FlicManager};
 pub use reconnect::ReconnectPolicy;
 pub use session::{
     DisconnectReason, EventResumeState, PairingCredentials, Session, SessionEvent, SessionInput,
 };
 pub use transport::{BleTransport, Discovery};
-
-pub use btleplug::api::CentralState;

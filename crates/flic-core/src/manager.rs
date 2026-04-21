@@ -64,15 +64,36 @@ pub enum FlicEvent {
         id: String,
         reason: DisconnectReason,
     },
-    /// Reconnect supervisor is about to sleep `after` then make `attempt`.
+    /// Reconnect supervisor is about to sleep `after_millis` then make `attempt`.
     Reconnecting {
         id: String,
         attempt: u32,
-        after: Duration,
+        after_millis: u64,
         last_reason: DisconnectReason,
     },
     /// BLE adapter powered off — retries paused until it returns.
     AdapterUnavailable { id: String },
+}
+
+/// Power state of the BLE adapter, in flic-core's own vocabulary. Mirrors
+/// btleplug's `CentralState` but keeps btleplug out of the public API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdapterState {
+    PoweredOn,
+    PoweredOff,
+    /// Transient state reported during power-state transitions on macOS.
+    /// Callers should treat this as "try anyway" rather than "give up."
+    Unknown,
+}
+
+impl From<CentralState> for AdapterState {
+    fn from(state: CentralState) -> Self {
+        match state {
+            CentralState::PoweredOn => Self::PoweredOn,
+            CentralState::PoweredOff => Self::PoweredOff,
+            CentralState::Unknown => Self::Unknown,
+        }
+    }
 }
 
 const BROADCAST_CAPACITY: usize = 1024;
@@ -124,8 +145,8 @@ impl FlicManager {
     }
 
     /// Reads the current BLE adapter power state.
-    pub async fn adapter_state(&self) -> CentralState {
-        self.transport.adapter_state().await
+    pub async fn adapter_state(&self) -> AdapterState {
+        self.transport.adapter_state().await.into()
     }
 
     /// Scans for Flic 2 peripherals for `timeout`.
@@ -705,7 +726,7 @@ fn supervisor_event_to_flic(id: &str, evt: SupervisorEvent) -> Option<FlicEvent>
         } => Some(FlicEvent::Reconnecting {
             id: id.to_string(),
             attempt,
-            after,
+            after_millis: u64::try_from(after.as_millis()).unwrap_or(u64::MAX),
             last_reason,
         }),
         SupervisorEvent::AdapterUnavailable => Some(FlicEvent::AdapterUnavailable {
