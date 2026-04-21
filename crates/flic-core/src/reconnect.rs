@@ -337,6 +337,35 @@ mod tests {
     }
 
     #[test]
+    fn adapter_off_preempts_any_active_state_and_back_on_restarts_at_one() {
+        // Adapter off from Connecting.
+        let mut sup = Supervisor::new(ReconnectPolicy::default());
+        sup.step(SupervisorInput::Start);
+        let actions = sup.step(SupervisorInput::AdapterPowered(false));
+        assert_eq!(sup.state(), SupervisorState::AdapterOff);
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(
+            &actions[0],
+            SupervisorAction::Emit(SupervisorEvent::AdapterUnavailable)
+        ));
+
+        // Adapter back on: fresh attempt 1, not resuming whatever was pending.
+        let actions = sup.step(SupervisorInput::AdapterPowered(true));
+        assert_eq!(sup.state(), SupervisorState::Connecting { attempt: 1 });
+        assert!(matches!(actions[0], SupervisorAction::InitiateConnect));
+
+        // Adapter off from Backoff should also preempt.
+        let mut sup2 = Supervisor::new(ReconnectPolicy::default());
+        sup2.step(SupervisorInput::Start);
+        sup2.step(SupervisorInput::AttemptFailed(
+            crate::session::DisconnectReason::PingTimeout,
+        ));
+        assert!(matches!(sup2.state(), SupervisorState::Backoff { .. }));
+        sup2.step(SupervisorInput::AdapterPowered(false));
+        assert_eq!(sup2.state(), SupervisorState::AdapterOff);
+    }
+
+    #[test]
     fn delay_respects_custom_policy() {
         let p = ReconnectPolicy {
             initial_backoff: Duration::from_millis(100),
