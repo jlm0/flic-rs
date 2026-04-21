@@ -196,6 +196,21 @@ impl Session {
         }
     }
 
+    /// Records the button's reported continuity from
+    /// `InitButtonEventsResponseWithBootId`. Called once per QuickVerify.
+    fn record_events_resumed(&mut self, event_count: u32, boot_id: u32) {
+        self.event_resume = EventResumeState {
+            event_count,
+            boot_id,
+        };
+    }
+
+    /// Advances the persisted event_count after we ACK a `ButtonEventNotification`.
+    /// `boot_id` is invariant across a single session and is left untouched.
+    fn record_acked_events(&mut self, last_ack_count: u32) {
+        self.event_resume.event_count = last_ack_count;
+    }
+
     /// Returns the event-continuity values the session currently knows about.
     /// Callers persist this across reconnects so the button can suppress events
     /// already delivered on a previous session.
@@ -556,6 +571,7 @@ impl Session {
         self.verify_inbound_mac(op, payload, mac)?;
         let resp = InitButtonEventsResponseWithBootId::parse(payload)?;
         self.counter_from_button = self.counter_from_button.wrapping_add(1);
+        self.record_events_resumed(resp.event_count, resp.boot_id);
         self.state = State::SessionEstablished;
         Ok(vec![SessionAction::Emit(SessionEvent::EventsResumed {
             event_count: resp.event_count,
@@ -604,6 +620,7 @@ impl Session {
                 for pkt in frame::encode_frame(self.conn_id, false, &signed) {
                     actions.push(SessionAction::WritePacket(pkt));
                 }
+                self.record_acked_events(count);
             }
             return Ok(actions);
         }
