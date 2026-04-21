@@ -849,6 +849,34 @@ mod tests {
     }
 
     #[test]
+    fn record_events_resumed_updates_resume_state() {
+        let mut sess = Session::new();
+        sess.record_events_resumed(1024, 7);
+        let state = sess.resume_state();
+        assert_eq!(state.event_count, 1024);
+        assert_eq!(state.boot_id, 7);
+    }
+
+    #[test]
+    fn record_acked_events_advances_count_keeps_boot_id() {
+        let mut sess = Session::new();
+        sess.record_events_resumed(500, 2);
+        sess.record_acked_events(503);
+        let state = sess.resume_state();
+        assert_eq!(state.event_count, 503);
+        assert_eq!(state.boot_id, 2, "boot_id is fixed for the session");
+    }
+
+    #[test]
+    fn record_acked_events_before_resume_still_works() {
+        let mut sess = Session::new();
+        sess.record_acked_events(42);
+        let state = sess.resume_state();
+        assert_eq!(state.event_count, 42);
+        assert_eq!(state.boot_id, 0);
+    }
+
+    #[test]
     fn is_retryable_classifies_every_disconnect_reason() {
         // Transient link-layer problems — the button is still ours, just re-handshake.
         assert!(DisconnectReason::PingTimeout.is_retryable());
