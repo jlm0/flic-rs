@@ -379,6 +379,40 @@ mod tests {
     }
 
     #[test]
+    fn user_disconnect_is_terminal_from_any_active_state() {
+        for prep in [
+            |s: &mut Supervisor| {
+                s.step(SupervisorInput::Start);
+            },
+            |s: &mut Supervisor| {
+                s.step(SupervisorInput::Start);
+                s.step(SupervisorInput::AttemptSucceeded);
+            },
+            |s: &mut Supervisor| {
+                s.step(SupervisorInput::Start);
+                s.step(SupervisorInput::AttemptFailed(
+                    crate::session::DisconnectReason::PingTimeout,
+                ));
+            },
+            |s: &mut Supervisor| {
+                s.step(SupervisorInput::Start);
+                s.step(SupervisorInput::AdapterPowered(false));
+            },
+        ] {
+            let mut sup = Supervisor::new(ReconnectPolicy::default());
+            prep(&mut sup);
+            let actions = sup.step(SupervisorInput::UserDisconnect);
+            assert_eq!(sup.state(), SupervisorState::Stopped);
+            assert_eq!(actions.len(), 2);
+            assert!(matches!(
+                &actions[0],
+                SupervisorAction::Emit(SupervisorEvent::Stopped { final_reason: None })
+            ));
+            assert!(matches!(actions[1], SupervisorAction::Stop));
+        }
+    }
+
+    #[test]
     fn delay_respects_custom_policy() {
         let p = ReconnectPolicy {
             initial_backoff: Duration::from_millis(100),
