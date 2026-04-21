@@ -94,11 +94,26 @@ impl FlicManager {
         self.transport.scan(timeout).await
     }
 
-    /// Runs the FullVerify handshake against a button in Public Mode and returns
-    /// persistable credentials on success.
+    /// Waits for a specific peripheral by ID, returning as soon as it's seen on-air.
+    /// Much faster than `scan` when you already know which peripheral you want.
     ///
-    /// This blocks until pairing completes or fails. Events (Paired, Connected,
-    /// EventsResumed) are also broadcast on [`Self::subscribe`] receivers.
+    /// # Errors
+    ///
+    /// Returns [`FlicError::NotFound`] if the timeout elapses before the peripheral
+    /// advertises.
+    pub async fn find(
+        &self,
+        peripheral_id_str: &str,
+        timeout: Duration,
+    ) -> Result<Discovery, FlicError> {
+        self.transport
+            .find_peripheral(peripheral_id_str, timeout)
+            .await
+    }
+
+    /// Runs the FullVerify handshake against a button in Public Mode and returns
+    /// persistable credentials on success. Exits cleanly after the `Paired` event
+    /// arrives — does not maintain a long-lived session.
     ///
     /// # Errors
     ///
@@ -107,13 +122,26 @@ impl FlicManager {
         let conn = self.transport.connect(id).await?;
         let mut session = Session::new();
         let mut creds: Option<PairingCredentials> = None;
+
         let initial = session.step(SessionInput::BeginPairing)?;
-        self.pump(&mut session, &conn, initial, id, &mut |_, ev| {
-            if let SessionEvent::Paired(c) = ev {
-                creds = Some(c.clone());
+        apply_actions(&conn, initial, id, &self.event_tx, &mut |_, _| {}).await?;
+
+        let mut notifications = conn.notifications().await?;
+        while let Some(packet) = notifications.next().await {
+            let actions = session.step(SessionInput::IncomingPacket(packet))?;
+            for action in &actions {
+                if let SessionAction::Emit(SessionEvent::Paired(c)) = action {
+                    creds = Some(c.clone());
+                }
             }
-        })
-        .await?;
+            let closed = apply_actions(&conn, actions, id, &self.event_tx, &mut |_, _| {}).await?;
+            if creds.is_some() || closed {
+                break;
+            }
+        }
+
+        drop(notifications);
+        let _ = conn.disconnect().await;
 
         creds.ok_or_else(|| FlicError::PairingFailed("session ended before Paired event".into()))
     }
@@ -158,27 +186,6 @@ impl FlicManager {
             task: handle,
             disconnect_tx,
         })
-    }
-
-    async fn pump(
-        &self,
-        session: &mut Session,
-        conn: &BleConnection,
-        initial_actions: Vec<SessionAction>,
-        id: &PeripheralId,
-        on_event: &mut impl FnMut(&PeripheralId, &SessionEvent),
-    ) -> Result<(), FlicError> {
-        apply_actions(conn, initial_actions, id, &self.event_tx, on_event).await?;
-
-        let mut notifications = conn.notifications().await?;
-        while let Some(packet) = notifications.next().await {
-            let actions = session.step(SessionInput::IncomingPacket(packet))?;
-            let closed = apply_actions(conn, actions, id, &self.event_tx, on_event).await?;
-            if closed {
-                break;
-            }
-        }
-        Ok(())
     }
 }
 

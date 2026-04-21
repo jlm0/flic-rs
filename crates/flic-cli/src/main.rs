@@ -120,7 +120,7 @@ fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "flic_cli=info,flic_core=info".into()),
+                .unwrap_or_else(|_| "flic_cli=debug,flic_core=debug".into()),
         )
         .init();
 
@@ -175,20 +175,11 @@ async fn scan(seconds: u64) -> anyhow::Result<()> {
 
 async fn pair(peripheral_id: &str, out: &std::path::Path) -> anyhow::Result<()> {
     let manager = FlicManager::new().await?;
-    // We need a `PeripheralId` — btleplug's `PeripheralId` is opaque and platform-specific.
-    // Users first run `scan`, then pass the printed ID back here. We match the string
-    // representation produced by Debug/Display on PeripheralId.
-    let targets = manager.scan(Duration::from_secs(6)).await?;
-    let Some(target) = targets
-        .iter()
-        .find(|d| format!("{}", d.id) == peripheral_id)
-    else {
-        anyhow::bail!("peripheral '{peripheral_id}' not in current scan results");
-    };
-    info!(
-        id = peripheral_id,
-        "pairing (requires button in Public Mode)"
-    );
+    println!("Hold the Flic button for ~7 seconds until the LED flashes rapidly and");
+    println!("you see two extra flashes AFTER you release it. That's Public Mode —");
+    println!("you have ~30 seconds to pair. Starting scan now...");
+    info!(id = peripheral_id, "waiting for Public-Mode advertisement");
+    let target = manager.find(peripheral_id, Duration::from_secs(30)).await?;
     let creds = manager.pair(&target.id).await?;
     let stored = StoredCreds::from_creds(&creds, peripheral_id);
     let json = serde_json::to_string_pretty(&stored)?;
@@ -207,13 +198,10 @@ async fn listen(peripheral_id: &str, creds_path: &std::path::Path) -> anyhow::Re
     let creds = stored.to_creds()?;
 
     let manager = FlicManager::new().await?;
-    let targets = manager.scan(Duration::from_secs(6)).await?;
-    let Some(target) = targets
-        .iter()
-        .find(|d| format!("{}", d.id) == peripheral_id)
-    else {
-        anyhow::bail!("peripheral '{peripheral_id}' not advertising");
-    };
+    println!("Click the Flic button once to wake it — it advertises briefly after");
+    println!("each click in Private Mode. Ready to listen...");
+    info!("waiting for advertisement");
+    let target = manager.find(peripheral_id, Duration::from_secs(30)).await?;
 
     let mut events = manager.subscribe();
 

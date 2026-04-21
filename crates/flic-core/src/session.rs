@@ -34,6 +34,11 @@ use crate::protocol::messages::{
     QuickVerifyNegativeResponse, QuickVerifyRequest, QuickVerifyResponse,
 };
 
+/// QuickVerify flags byte: supports_duo=1 (0x40). Sent in `QuickVerifyRequest.flags`
+/// and also used as the middle byte of the session-key derivation input block —
+/// the two MUST stay in lockstep or the button's MAC won't verify.
+const QUICK_VERIFY_FLAGS: u8 = 0x40;
+
 /// Persistent identity material for a paired Flic button. Caller serializes + stores.
 #[derive(Debug, Clone)]
 pub struct PairingCredentials {
@@ -226,7 +231,7 @@ impl Session {
 
         let body = QuickVerifyRequest {
             client_random,
-            flags: 0x40, // supports_duo for forward compat
+            flags: QUICK_VERIFY_FLAGS,
             tmp_id,
             pairing_id: creds.pairing_id,
         }
@@ -464,12 +469,14 @@ impl Session {
 
         let (payload, mac) = frame.split_signed()?;
 
-        // Derive session_key = Chaskey(pairing_key, client_random || 0x00 || button_random).
+        // Derive session_key = Chaskey(pairing_key, client_random[7] || flags || button_random[8]).
+        // The middle byte is the flags byte we sent in the QuickVerifyRequest — must match
+        // bit-for-bit. We always send `supports_duo = 1` (0x40); keep the two in lockstep.
         let subkeys_from_pairing = chaskey::generate_subkeys(&creds.pairing_key);
         let resp = QuickVerifyResponse::parse(payload)?;
         let mut block = [0u8; 16];
         block[..7].copy_from_slice(&client_random);
-        block[7] = 0x00;
+        block[7] = QUICK_VERIFY_FLAGS;
         block[8..].copy_from_slice(&resp.button_random);
         let session_key = chaskey::mac_16_bytes(&subkeys_from_pairing, &block);
 
