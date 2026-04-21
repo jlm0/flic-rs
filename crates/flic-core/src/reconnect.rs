@@ -173,7 +173,6 @@ impl Supervisor {
                 SupervisorState::Connecting { .. } | SupervisorState::Listening,
                 SupervisorInput::AttemptFailed(reason),
             ) => {
-                // Fatal failure from either state: terminate.
                 self.state = SupervisorState::Stopped;
                 vec![
                     SupervisorAction::Emit(SupervisorEvent::Stopped {

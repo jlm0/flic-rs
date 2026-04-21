@@ -444,16 +444,13 @@ async fn drive_loop(
     }
 }
 
-/// Runs one `find → connect → listen` attempt. Returns the
-/// [`DisconnectReason`] that ended the session, or an error if the setup
-/// couldn't complete.
 #[derive(Debug, Clone)]
 struct AttemptOutcome {
     reason: DisconnectReason,
     reached_established: bool,
     /// True when the session itself emitted `FlicEvent::Disconnected` for this
-    /// outcome. Used by the supervisor to suppress a redundant final
-    /// `Disconnected` on non-retryable failures (the session is authoritative).
+    /// outcome. The supervisor uses this to suppress a redundant final
+    /// `Disconnected` on non-retryable failures — the session is authoritative.
     session_emitted_disconnected: bool,
 }
 
@@ -515,7 +512,6 @@ async fn run_one_attempt(
         tokio::select! {
             () = cancel.cancelled() => {
                 let _ = disconnect_tx.send(()).await;
-                // Fall through and wait for drive to exit.
                 break Ok(());
             }
             evt = rx.recv() => {
@@ -586,7 +582,6 @@ async fn run_supervisor(
     }
 
     loop {
-        // Drain all queued actions first.
         let mut maybe_attempt: Option<(PairingCredentials, EventResumeState)> = None;
         for action in actions.drain(..) {
             match action {
@@ -617,7 +612,6 @@ async fn run_supervisor(
         }
 
         if let Some((creds, resume)) = maybe_attempt {
-            // Spawn the attempt; race it against cancel/adapter events.
             let attempt_cancel = cancel.child_token();
             let attempt = run_one_attempt(
                 transport.as_ref(),
@@ -649,7 +643,6 @@ async fn run_supervisor(
                                 }
                             }
                             None => {
-                                // Adapter event stream ended — rare.
                                 attempt_cancel.cancel();
                                 let _ = (&mut attempt).await;
                                 break SupervisorInput::AttemptFailed(DisconnectReason::BleTransport(
@@ -679,7 +672,6 @@ async fn run_supervisor(
             continue;
         }
 
-        // No attempt queued — wait for sleep/adapter/cancel.
         if supervisor.state() == SupervisorState::Stopped {
             return Ok(());
         }

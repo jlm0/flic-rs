@@ -117,7 +117,6 @@ pub fn encode_frame_with_mtu(
             0
         };
 
-    // body fits in one packet (plus the control byte): no fragmentation needed.
     if body.len() < max_packet {
         let mut packet = Vec::with_capacity(1 + body.len());
         packet.push(base_control);
@@ -125,7 +124,6 @@ pub fn encode_frame_with_mtu(
         return vec![packet];
     }
 
-    // Fragmented path: each fragment carries [control_byte | optional flag, body_chunk].
     let chunk_size = max_packet - 1;
     let mut fragments = Vec::new();
     let mut offset = 0;
@@ -210,7 +208,6 @@ impl Reassembler {
             }
             Ok(None)
         } else if is_fragment {
-            // First fragment of a multi-fragment frame.
             self.held_conn_id = conn_id;
             self.held_newly_assigned = newly_assigned;
             self.buffer.clear();
@@ -218,7 +215,6 @@ impl Reassembler {
             self.expecting_more = true;
             Ok(None)
         } else {
-            // Complete single-packet frame.
             let frame = RawFrame {
                 conn_id,
                 newly_assigned,

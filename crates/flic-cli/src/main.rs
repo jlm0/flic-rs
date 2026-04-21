@@ -242,7 +242,6 @@ async fn listen(peripheral_id: &str, creds_path: &Path) -> anyhow::Result<()> {
         }
     }
 
-    // Final flush of resume state before exit.
     drainer.shutdown().await;
     Ok(())
 }
@@ -279,7 +278,6 @@ fn spawn_drainer(
         loop {
             tokio::select! {
                 _ = shutdown_rx.recv() => {
-                    // Final flush.
                     let latest = *resume_rx.borrow();
                     if latest.event_count != last_written.event_count
                         || latest.boot_id != last_written.boot_id
@@ -314,8 +312,11 @@ fn spawn_drainer(
                     }
                 }
                 change = resume_rx.changed() => {
+                    // Writes are owned by the ticker (intentional 10s debounce).
+                    // This arm exists only to observe sender-drop — when the
+                    // supervisor exits the channel closes, and we must final-
+                    // flush before returning or the last few events are lost.
                     if change.is_err() {
-                        // Sender dropped — supervisor has exited. Final flush and exit.
                         let latest = *resume_rx.borrow();
                         if latest.event_count != last_written.event_count
                             || latest.boot_id != last_written.boot_id
@@ -327,10 +328,6 @@ fn spawn_drainer(
                         }
                         return;
                     }
-                    // Value advanced. Writes are owned by the ticker (intentional
-                    // 10s debounce). This arm only exists to detect sender-drop
-                    // above — we mark the change as seen and let the ticker do
-                    // the persistence.
                 }
             }
         }

@@ -1,9 +1,9 @@
-// Hardware smoke test: connect to the paired button via the napi binding
-// and log every event until Ctrl-C. Mirrors `flic-cli listen` but drives
-// the JS API so we can prove the ThreadsafeFunction event path works.
+// Hardware smoke test: connect to a paired button via the napi binding and
+// log every event until Ctrl-C. Mirrors `flic-cli listen` but exercises the
+// JS API so the ThreadsafeFunction event path is covered.
 //
-// Expects a creds.json at ../../creds.json (flic-rs root) from the Phase 5
-// pairing. Writes resume-state updates back every 10s.
+// Expects a creds.json at ../../creds.json (workspace root) produced by
+// `flic-cli pair`. Writes resume-state updates back every 10s.
 
 import { readFileSync, writeFileSync, renameSync } from 'node:fs';
 import { resolve } from 'node:path';

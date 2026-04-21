@@ -76,7 +76,6 @@ mod tests {
 
     #[test]
     fn all_16_codes_decode() {
-        // Spec-defined codes — assert specific mappings.
         assert_eq!(decode_press_kind(0), PressKind::Up);
         assert_eq!(decode_press_kind(1), PressKind::Down);
         assert_eq!(decode_press_kind(2), PressKind::SingleClick);
@@ -87,7 +86,6 @@ mod tests {
         assert_eq!(decode_press_kind(14), PressKind::UpAfterHold);
         assert_eq!(decode_press_kind(15), PressKind::ClickPending);
 
-        // Reserved codes → Unknown.
         for code in [4, 5, 6, 7, 9, 12, 13] {
             assert_eq!(
                 decode_press_kind(code),
@@ -99,11 +97,9 @@ mod tests {
 
     #[test]
     fn ack_rules() {
-        // These require ACK (decisive events).
         for code in [2, 3, 10, 11, 14] {
             assert!(requires_ack(code), "code {code} must require ack");
         }
-        // These don't (raw/intermediate).
         for code in [0, 1, 4, 5, 6, 7, 8, 9, 12, 13, 15] {
             assert!(!requires_ack(code), "code {code} must not require ack");
         }

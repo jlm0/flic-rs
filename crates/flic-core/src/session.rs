@@ -21,7 +21,7 @@
 use rand::rngs::OsRng;
 use rand::RngCore;
 
-use crate::constants::{Direction, OpcodeFromFlic, OpcodeToFlic, FLIC2_ED25519_PUBLIC_KEY};
+use crate::constants::{Direction, OpcodeFromFlic, FLIC2_ED25519_PUBLIC_KEY};
 use crate::crypto::{chaskey, ed25519, kdf, x25519};
 use crate::error::FlicError;
 use crate::events::{decode_press_kind, requires_ack, PressKind};
@@ -289,7 +289,6 @@ impl Session {
     fn on_user_disconnect(&mut self) -> Result<Vec<SessionAction>, FlicError> {
         let mut actions = Vec::new();
         if self.state == State::SessionEstablished {
-            // Send DISCONNECT_VERIFIED_LINK_IND (signed).
             let body = DisconnectVerifiedLinkInd.write();
             let signed = self.sign_outbound(&body)?;
             for pkt in frame::encode_frame(self.conn_id, false, &signed) {
@@ -350,7 +349,7 @@ impl Session {
             ));
         }
 
-        // Verify Ed25519 signature over button_address || address_type || button_ecdh_pub.
+        // Signed message shape: button_address || address_type || button_ecdh_pub.
         let mut signed_data = [0u8; 39];
         signed_data[..6].copy_from_slice(&resp.button_address);
         signed_data[6] = resp.address_type;
@@ -370,12 +369,10 @@ impl Session {
             ]);
         };
 
-        // Record newly-assigned conn_id.
         if frame.newly_assigned {
             self.conn_id = frame.conn_id;
         }
 
-        // Derive keys.
         let keypair = x25519::Keypair::generate();
         let shared_secret = keypair.diffie_hellman(&resp.button_ecdh_pub);
         let mut client_random = [0u8; 8];
@@ -527,7 +524,6 @@ impl Session {
         self.counter_to_button = 0;
         self.counter_from_button = 0;
 
-        // Verify MAC.
         self.verify_inbound_mac(op, payload, mac)?;
 
         if frame.newly_assigned {
@@ -744,22 +740,9 @@ fn random_u32() -> u32 {
     u32::from_le_bytes(buf)
 }
 
-// Suppress Direction dead-code warning for the OpcodeToFlic import used in
-// constants but not (yet) directly here.
-#[allow(dead_code)]
-fn _opcode_to_flic_keep_alive() -> u8 {
-    OpcodeToFlic::PingResponse as u8
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // The state machine's happy-path flows require multi-step orchestration against
-    // fake button responses. These tests ensure the initial transitions are correct
-    // and that the first packet off the wire is well-formed. Full handshake
-    // integration tests require either real hardware or a simulator (planned for
-    // a later slice).
 
     #[test]
     fn begin_pairing_emits_full_verify_request_1() {
@@ -802,7 +785,6 @@ mod tests {
             "ctrl + opcode + 7b random + flags + tmp_id + pairing_id"
         );
         assert_eq!(pkt[1], QuickVerifyRequest::OPCODE);
-        // Layout: ctrl(1) + opcode(1) + random(7) + flags(1) + tmp_id(4) + pairing_id(4)
         let pid = u32::from_le_bytes([pkt[14], pkt[15], pkt[16], pkt[17]]);
         assert_eq!(pid, 0xDEAD_BEEF);
     }
@@ -812,8 +794,6 @@ mod tests {
         let mut sess = Session::new();
         sess.step(SessionInput::BeginPairing).expect("ok");
         let actions = sess.step(SessionInput::UserDisconnect).expect("ok");
-        // Two actions: Emit(Disconnected), CloseSession (no signed frame without
-        // a session key).
         assert!(matches!(
             actions[0],
             SessionAction::Emit(SessionEvent::Disconnected {

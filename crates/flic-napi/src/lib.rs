@@ -23,7 +23,7 @@ use napi::threadsafe_function::{
 use napi::JsFunction;
 use napi_derive::napi;
 
-/// Current binding version. Smoke-test probe; harmless to keep in the release surface.
+/// Current binding version (from `CARGO_PKG_VERSION`).
 #[napi]
 pub fn version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
@@ -459,9 +459,7 @@ impl FlicManager {
                         );
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        // Subscriber fell behind; continue.
-                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                 }
             }
         });

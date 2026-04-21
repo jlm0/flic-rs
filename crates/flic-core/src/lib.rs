@@ -4,10 +4,11 @@
 //!
 //! - [`constants`] — protocol constants (service UUIDs, MTU, opcodes, Flic's Ed25519 master key)
 //! - [`crypto`] — Chaskey-LTS MAC, Ed25519 variant-verify, HMAC-SHA256 KDF, X25519 ECDH
-//! - `protocol` (TODO) — frame encode/decode, fragmentation, message types
-//! - `session` (TODO) — state machine: FullVerify, QuickVerify, TestIfReallyUnpaired
-//! - `transport` (TODO) — btleplug wrapper (scan filter, GATT write/notify, adapter watching)
-//! - `manager` (TODO) — public entry point
+//! - [`protocol`] — frame encode/decode, fragmentation, typed message parse/write
+//! - [`session`] — pure state machine: FullVerify, QuickVerify, steady-state events
+//! - [`reconnect`] — pure reconnect supervisor with backoff + adapter-state gating
+//! - [`transport`] — btleplug-backed BLE glue
+//! - [`manager`] — public async entry point that wires the pieces together
 //!
 //! The crypto and protocol layers have zero I/O, zero async, and are byte-exact against
 //! fixtures generated from [pyflic-ble](https://github.com/50ButtonsEach/pyflic-ble).
