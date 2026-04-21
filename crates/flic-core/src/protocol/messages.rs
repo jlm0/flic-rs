@@ -481,6 +481,43 @@ impl InitButtonEventsResponseWithBootId {
     }
 }
 
+/// Opcode 11 (from button) — `InitButtonEventsResponseWithoutBootId`. Signed.
+///
+/// The button sends this variant when the `boot_id` we supplied in
+/// `InitButtonEventsLightRequest` doesn't match its current boot_id — continuity
+/// is lost and the caller should treat this as a fresh start. Identical layout
+/// to opcode 10 minus the `boot_id` tail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InitButtonEventsResponseWithoutBootId {
+    pub has_queued_events: bool,
+    pub timestamp_32k: u64, // 47 bits
+    pub event_count: u32,
+}
+
+impl InitButtonEventsResponseWithoutBootId {
+    /// Parses the payload. Layout: 48-bit packed (1 bit has_queued + 47 bits timestamp)
+    /// || event_count(4) = 10 bytes.
+    pub fn parse(payload: &[u8]) -> Result<Self, FlicError> {
+        if payload.len() < 10 {
+            return Err(FlicError::ProtocolViolation(format!(
+                "InitButtonEventsResponseWithoutBootId too short: {} bytes",
+                payload.len()
+            )));
+        }
+        let mut packed_bytes = [0u8; 8];
+        packed_bytes[..6].copy_from_slice(&payload[0..6]);
+        let packed = u64::from_le_bytes(packed_bytes);
+        let has_queued_events = (packed & 0x1) != 0;
+        let timestamp_32k = (packed >> 1) & 0x7FFF_FFFF_FFFF;
+        let event_count = u32::from_le_bytes([payload[6], payload[7], payload[8], payload[9]]);
+        Ok(Self {
+            has_queued_events,
+            timestamp_32k,
+            event_count,
+        })
+    }
+}
+
 /// A single button event slot inside a `ButtonEventNotification` (opcode 12).
 /// 7 bytes: 48-bit timestamp + 4-bit event code + 2 flag bits + 2 rfu bits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -705,6 +742,30 @@ mod tests {
         assert_eq!(parsed.timestamp_32k, 0x3FF);
         assert_eq!(parsed.event_count, 0x0A0B0C0D);
         assert_eq!(parsed.boot_id, 0x1E1F2021);
+    }
+
+    #[test]
+    fn init_button_events_response_without_boot_id_parses() {
+        // The button emits this variant when our supplied boot_id doesn't match
+        // its current one — continuity is lost. Payload is identical to the
+        // WithBootId variant minus the trailing boot_id field.
+        let mut payload = Vec::with_capacity(10);
+        let packed: u64 = 0x1234u64 << 1; // has_queued=false
+        payload.extend_from_slice(&packed.to_le_bytes()[..6]);
+        payload.extend_from_slice(&42u32.to_le_bytes());
+
+        let parsed = InitButtonEventsResponseWithoutBootId::parse(&payload).expect("parse");
+        assert!(!parsed.has_queued_events);
+        assert_eq!(parsed.timestamp_32k, 0x1234);
+        assert_eq!(parsed.event_count, 42);
+    }
+
+    #[test]
+    fn init_button_events_response_without_boot_id_rejects_short_payload() {
+        let short = [0u8; 9];
+        let err = InitButtonEventsResponseWithoutBootId::parse(&short)
+            .expect_err("must reject < 10 bytes");
+        assert!(matches!(err, FlicError::ProtocolViolation(_)));
     }
 
     #[test]

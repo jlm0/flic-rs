@@ -30,8 +30,9 @@ use crate::protocol::messages::{
     AckButtonEventsInd, ButtonEventNotification, DisconnectVerifiedLinkInd,
     DisconnectedVerifiedLinkInd, FullVerifyFailResponse, FullVerifyRequest1, FullVerifyRequest2,
     FullVerifyResponse1, FullVerifyResponse2, InitButtonEventsLightRequest,
-    InitButtonEventsResponseWithBootId, NoLogicalConnectionSlotsInd, PingResponse,
-    QuickVerifyNegativeResponse, QuickVerifyRequest, QuickVerifyResponse,
+    InitButtonEventsResponseWithBootId, InitButtonEventsResponseWithoutBootId,
+    NoLogicalConnectionSlotsInd, PingResponse, QuickVerifyNegativeResponse, QuickVerifyRequest,
+    QuickVerifyResponse,
 };
 
 /// QuickVerify flags byte: supports_duo=1 (0x40). Sent in `QuickVerifyRequest.flags`
@@ -564,19 +565,31 @@ impl Session {
         frame: &RawFrame,
     ) -> Result<Vec<SessionAction>, FlicError> {
         let op = frame.opcode();
-        if op != OpcodeFromFlic::InitButtonEventsResponseWithBootId as u8 {
-            return self.unexpected_opcode(op);
-        }
         let (payload, mac) = frame.split_signed()?;
         self.verify_inbound_mac(op, payload, mac)?;
-        let resp = InitButtonEventsResponseWithBootId::parse(payload)?;
+
+        let (event_count, boot_id, has_queued_events) =
+            if op == OpcodeFromFlic::InitButtonEventsResponseWithBootId as u8 {
+                let resp = InitButtonEventsResponseWithBootId::parse(payload)?;
+                (resp.event_count, resp.boot_id, resp.has_queued_events)
+            } else if op == OpcodeFromFlic::InitButtonEventsResponseWithoutBootId as u8 {
+                // Continuity lost — our stored boot_id didn't match the device's.
+                // Persist boot_id=0 so the next reconnect sends the "no prior
+                // context" sentinel, letting the device re-establish continuity
+                // cleanly via the WithBootId reply.
+                let resp = InitButtonEventsResponseWithoutBootId::parse(payload)?;
+                (resp.event_count, 0, resp.has_queued_events)
+            } else {
+                return self.unexpected_opcode(op);
+            };
+
         self.counter_from_button = self.counter_from_button.wrapping_add(1);
-        self.record_events_resumed(resp.event_count, resp.boot_id);
+        self.record_events_resumed(event_count, boot_id);
         self.state = State::SessionEstablished;
         Ok(vec![SessionAction::Emit(SessionEvent::EventsResumed {
-            event_count: resp.event_count,
-            boot_id: resp.boot_id,
-            has_queued_events: resp.has_queued_events,
+            event_count,
+            boot_id,
+            has_queued_events,
         })])
     }
 
