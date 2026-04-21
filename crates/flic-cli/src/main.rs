@@ -173,6 +173,28 @@ async fn scan(seconds: u64) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Keeps calling `manager.find` in short windows, printing a heartbeat every retry,
+/// until the target shows up or the user Ctrl-Cs.
+async fn find_with_retry(
+    manager: &FlicManager,
+    peripheral_id: &str,
+) -> anyhow::Result<flic_core::Discovery> {
+    let per_attempt = Duration::from_secs(8);
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        match manager.find(peripheral_id, per_attempt).await {
+            Ok(target) => return Ok(target),
+            Err(e) => {
+                info!(attempt, ?e, "no advertisement caught — click the button");
+                println!(
+                    "  …still waiting (attempt {attempt}). Click the button now; will keep retrying."
+                );
+            }
+        }
+    }
+}
+
 async fn pair(peripheral_id: &str, out: &std::path::Path) -> anyhow::Result<()> {
     let manager = FlicManager::new().await?;
     println!("Hold the Flic button for ~7 seconds until the LED flashes rapidly and");
@@ -198,10 +220,9 @@ async fn listen(peripheral_id: &str, creds_path: &std::path::Path) -> anyhow::Re
     let creds = stored.to_creds()?;
 
     let manager = FlicManager::new().await?;
-    println!("Click the Flic button once to wake it — it advertises briefly after");
-    println!("each click in Private Mode. Ready to listen...");
-    info!("waiting for advertisement");
-    let target = manager.find(peripheral_id, Duration::from_secs(30)).await?;
+    println!("Waiting for the Flic button. Click it to wake it — each click fires a");
+    println!("brief advertisement that we try to catch. Will retry until you Ctrl-C.");
+    let target = find_with_retry(&manager, peripheral_id).await?;
 
     let mut events = manager.subscribe();
 
