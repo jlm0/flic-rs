@@ -129,6 +129,7 @@ impl Supervisor {
     }
 
     /// Apply an input and return the resulting actions.
+    #[allow(clippy::match_same_arms)] // preserve state-transition readability over arm merging
     pub fn step(&mut self, input: SupervisorInput) -> Vec<SupervisorAction> {
         match (self.state, input) {
             (SupervisorState::Idle, SupervisorInput::Start) => {
@@ -154,15 +155,6 @@ impl Supervisor {
                     SupervisorAction::Sleep(after),
                 ]
             }
-            (SupervisorState::Connecting { .. }, SupervisorInput::AttemptFailed(reason)) => {
-                self.state = SupervisorState::Stopped;
-                vec![
-                    SupervisorAction::Emit(SupervisorEvent::Stopped {
-                        final_reason: Some(reason),
-                    }),
-                    SupervisorAction::Stop,
-                ]
-            }
             (SupervisorState::Listening, SupervisorInput::AttemptFailed(reason))
                 if reason.is_retryable() =>
             {
@@ -177,7 +169,11 @@ impl Supervisor {
                     SupervisorAction::Sleep(after),
                 ]
             }
-            (SupervisorState::Listening, SupervisorInput::AttemptFailed(reason)) => {
+            (
+                SupervisorState::Connecting { .. } | SupervisorState::Listening,
+                SupervisorInput::AttemptFailed(reason),
+            ) => {
+                // Fatal failure from either state: terminate.
                 self.state = SupervisorState::Stopped;
                 vec![
                     SupervisorAction::Emit(SupervisorEvent::Stopped {

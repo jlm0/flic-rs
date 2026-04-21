@@ -5,22 +5,23 @@
 //! - `doctor` — reports BLE adapter status
 //! - `scan` — discovers Flic 2 peripherals advertising over BLE
 //! - `pair <id>` — runs FullVerify against a button in Public Mode
-//! - `listen <id> --creds <path>` — reconnects via QuickVerify and prints events
+//! - `listen <id> --creds <path>` — reconnects via QuickVerify and prints events,
+//!   with automatic reconnect + persisted event continuity
 
 #![allow(clippy::too_many_lines)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use flic_core::manager::{FlicEvent, FlicManager};
-use flic_core::session::EventResumeState;
-use flic_core::PairingCredentials;
-use serde::{Deserialize, Serialize};
+use flic_core::ReconnectPolicy;
 use tokio::sync::broadcast::error::RecvError;
 use tracing::{error, info};
 
 mod creds;
+
+use creds::StoredCreds;
 
 #[derive(Parser)]
 #[command(name = "flic-cli")]
@@ -47,75 +48,13 @@ enum Command {
         #[arg(long, default_value = "creds.json")]
         out: PathBuf,
     },
-    /// Connects using stored credentials and prints events until Ctrl-C.
+    /// Connects using stored credentials, auto-reconnects on drops, and prints
+    /// events until Ctrl-C. Event continuity is persisted back to the creds file.
     Listen {
         peripheral_id: String,
         #[arg(long)]
         creds: PathBuf,
     },
-}
-
-/// Serialized form of [`PairingCredentials`] plus event-resume state. The CLI writes
-/// this on `pair` and reads it on `listen`.
-#[derive(Debug, Serialize, Deserialize)]
-struct StoredCreds {
-    pairing_id: u32,
-    pairing_key_hex: String,
-    serial_number: String,
-    button_uuid_hex: String,
-    firmware_version: u32,
-    peripheral_id: String,
-    #[serde(default)]
-    resume_event_count: u32,
-    #[serde(default)]
-    resume_boot_id: u32,
-}
-
-impl StoredCreds {
-    fn from_creds(creds: &PairingCredentials, peripheral_id: &str) -> Self {
-        Self {
-            pairing_id: creds.pairing_id,
-            pairing_key_hex: hex_encode(&creds.pairing_key),
-            serial_number: creds.serial_number.clone(),
-            button_uuid_hex: hex_encode(&creds.button_uuid),
-            firmware_version: creds.firmware_version,
-            peripheral_id: peripheral_id.to_string(),
-            resume_event_count: 0,
-            resume_boot_id: 0,
-        }
-    }
-
-    fn to_creds(&self) -> anyhow::Result<PairingCredentials> {
-        let pairing_key = hex_decode_fixed::<16>(&self.pairing_key_hex)?;
-        let button_uuid = hex_decode_fixed::<16>(&self.button_uuid_hex)?;
-        Ok(PairingCredentials {
-            pairing_id: self.pairing_id,
-            pairing_key,
-            serial_number: self.serial_number.clone(),
-            button_uuid,
-            firmware_version: self.firmware_version,
-        })
-    }
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        use std::fmt::Write;
-        write!(out, "{b:02x}").expect("write to string");
-    }
-    out
-}
-
-fn hex_decode_fixed<const N: usize>(s: &str) -> anyhow::Result<[u8; N]> {
-    if s.len() != N * 2 {
-        anyhow::bail!("expected {} hex chars, got {}", N * 2, s.len());
-    }
-    let mut out = [0u8; N];
-    for i in 0..N {
-        out[i] = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16)?;
-    }
-    Ok(out)
 }
 
 fn main() -> anyhow::Result<()> {
@@ -175,64 +114,48 @@ async fn scan(seconds: u64) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Keeps calling `manager.find` in short windows, printing a heartbeat every retry,
-/// until the target shows up or the user Ctrl-Cs.
-async fn find_with_retry(
-    manager: &FlicManager,
-    peripheral_id: &str,
-) -> anyhow::Result<flic_core::Discovery> {
-    let per_attempt = Duration::from_secs(8);
-    let mut attempt = 0u32;
-    loop {
-        attempt += 1;
-        match manager.find(peripheral_id, per_attempt).await {
-            Ok(target) => return Ok(target),
-            Err(e) => {
-                info!(attempt, ?e, "no advertisement caught — click the button");
-                println!(
-                    "  …still waiting (attempt {attempt}). Click the button now; will keep retrying."
-                );
-            }
-        }
-    }
-}
-
-async fn pair(peripheral_id: &str, out: &std::path::Path) -> anyhow::Result<()> {
+async fn pair(peripheral_id: &str, out: &Path) -> anyhow::Result<()> {
     let manager = FlicManager::new().await?;
     println!("Hold the Flic button for ~7 seconds until the LED flashes rapidly and");
     println!("you see two extra flashes AFTER you release it. That's Public Mode —");
     println!("you have ~30 seconds to pair. Starting scan now...");
     info!(id = peripheral_id, "waiting for Public-Mode advertisement");
     let target = manager.find(peripheral_id, Duration::from_secs(30)).await?;
-    let creds = manager.pair(&target.id).await?;
-    let stored = StoredCreds::from_creds(&creds, peripheral_id);
-    let json = serde_json::to_string_pretty(&stored)?;
-    std::fs::write(out, json)?;
+    let pairing = manager.pair(&target.id).await?;
+    let stored = StoredCreds::from_pairing(&pairing, peripheral_id);
+    creds::write_atomic(&stored, out)?;
     println!(
         "Paired. serial={} firmware={} pairing_id={}",
-        creds.serial_number, creds.firmware_version, creds.pairing_id
+        pairing.serial_number, pairing.firmware_version, pairing.pairing_id
     );
     println!("Credentials written to {}", out.display());
     Ok(())
 }
 
-async fn listen(peripheral_id: &str, creds_path: &std::path::Path) -> anyhow::Result<()> {
-    let raw = std::fs::read_to_string(creds_path)?;
-    let stored: StoredCreds = serde_json::from_str(&raw)?;
-    let creds = stored.to_creds()?;
+async fn listen(peripheral_id: &str, creds_path: &Path) -> anyhow::Result<()> {
+    let stored = creds::read(creds_path)?;
+    let pairing = stored.to_pairing()?;
+    let initial_resume = stored.resume_state();
 
     let manager = FlicManager::new().await?;
     println!("Waiting for the Flic button. Click it to wake it — each click fires a");
-    println!("brief advertisement that we try to catch. Will retry until you Ctrl-C.");
-    let target = find_with_retry(&manager, peripheral_id).await?;
+    println!("brief advertisement that we try to catch. Will keep reconnecting");
+    println!("automatically; press Ctrl-C to stop.");
 
+    let target = manager.find(peripheral_id, Duration::from_secs(3600)).await?;
     let mut events = manager.subscribe();
 
-    let resume = EventResumeState {
-        event_count: stored.resume_event_count,
-        boot_id: stored.resume_boot_id,
-    };
-    let handle = manager.listen(target.id.clone(), creds, resume).await?;
+    let handle = manager
+        .listen_with_reconnect(
+            target.id.clone(),
+            pairing,
+            initial_resume,
+            ReconnectPolicy::default(),
+        )
+        .await?;
+
+    let resume_rx = handle.subscribe_resume();
+    let drainer = spawn_drainer(resume_rx, creds_path.to_path_buf(), stored);
 
     info!("listening for events; press Ctrl-C to quit");
 
@@ -260,7 +183,98 @@ async fn listen(peripheral_id: &str, creds_path: &std::path::Path) -> anyhow::Re
             }
         }
     }
+
+    // Final flush of resume state before exit.
+    drainer.shutdown().await;
     Ok(())
+}
+
+/// Background task that persists the latest `EventResumeState` back to the
+/// creds file. Coalesces updates to at most one write per
+/// `PERSISTENCE_INTERVAL` (10s) and guarantees a final flush on shutdown.
+const PERSISTENCE_INTERVAL: Duration = Duration::from_secs(10);
+
+struct DrainerHandle {
+    task: tokio::task::JoinHandle<()>,
+    shutdown_tx: tokio::sync::mpsc::Sender<()>,
+}
+
+impl DrainerHandle {
+    async fn shutdown(self) {
+        let _ = self.shutdown_tx.send(()).await;
+        let _ = self.task.await;
+    }
+}
+
+fn spawn_drainer(
+    mut resume_rx: tokio::sync::watch::Receiver<flic_core::EventResumeState>,
+    creds_path: PathBuf,
+    mut stored: StoredCreds,
+) -> DrainerHandle {
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
+    let task = tokio::spawn(async move {
+        let mut last_written = stored.resume_state();
+        let mut ticker = tokio::time::interval(PERSISTENCE_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        ticker.tick().await; // drain the immediate first tick
+
+        loop {
+            tokio::select! {
+                _ = shutdown_rx.recv() => {
+                    // Final flush.
+                    let latest = *resume_rx.borrow();
+                    if latest.event_count != last_written.event_count
+                        || latest.boot_id != last_written.boot_id
+                    {
+                        stored.update_resume(latest);
+                        if let Err(e) = creds::write_atomic(&stored, &creds_path) {
+                            error!(?e, "final creds write failed");
+                        }
+                    }
+                    return;
+                }
+                _ = ticker.tick() => {
+                    let latest = *resume_rx.borrow();
+                    if latest.event_count == last_written.event_count
+                        && latest.boot_id == last_written.boot_id
+                    {
+                        continue;
+                    }
+                    stored.update_resume(latest);
+                    match creds::write_atomic(&stored, &creds_path) {
+                        Ok(()) => {
+                            last_written = latest;
+                            info!(
+                                event_count = latest.event_count,
+                                boot_id = latest.boot_id,
+                                "creds file updated"
+                            );
+                        }
+                        Err(e) => {
+                            error!(?e, "creds write failed — will retry on next tick");
+                        }
+                    }
+                }
+                change = resume_rx.changed() => {
+                    if change.is_err() {
+                        // Sender dropped — supervisor has exited. Do a final flush then return.
+                        let latest = *resume_rx.borrow();
+                        if latest.event_count != last_written.event_count
+                            || latest.boot_id != last_written.boot_id
+                        {
+                            stored.update_resume(latest);
+                            if let Err(e) = creds::write_atomic(&stored, &creds_path) {
+                                error!(?e, "final creds write failed");
+                            }
+                        }
+                        return;
+                    }
+                    // Value changed — the next ticker tick will write it. No immediate write.
+                }
+            }
+        }
+    });
+    DrainerHandle { task, shutdown_tx }
 }
 
 fn print_event(event: &FlicEvent) {

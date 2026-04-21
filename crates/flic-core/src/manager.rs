@@ -13,6 +13,8 @@
 //! The manager handles a single Flic at a time in this first slice. Multi-peripheral
 //! fan-out (one broadcast channel, many per-peripheral tasks) is a later slice.
 
+#![allow(clippy::too_many_lines)]
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -222,6 +224,7 @@ impl FlicManager {
     /// # Errors
     ///
     /// Returns any error that prevents the supervisor task from spawning.
+    #[allow(clippy::unused_async)] // async signature kept for symmetry with `listen`.
     pub async fn listen_with_reconnect(
         &self,
         id: PeripheralId,
@@ -581,10 +584,7 @@ async fn run_supervisor(
                         break match result {
                             Ok(outcome) => {
                                 if outcome.reached_established {
-                                    actions.push(SupervisorAction::InitiateConnect); // sentinel
-                                    let mut pre = supervisor.step(SupervisorInput::AttemptSucceeded);
-                                    actions.pop();
-                                    actions.extend(pre.drain(..));
+                                    actions.append(&mut supervisor.step(SupervisorInput::AttemptSucceeded));
                                 }
                                 SupervisorInput::AttemptFailed(outcome.reason)
                             }

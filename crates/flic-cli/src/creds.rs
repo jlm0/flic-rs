@@ -9,9 +9,9 @@ use serde::{Deserialize, Serialize};
 /// Current on-disk schema version. Bump when the shape changes incompatibly.
 pub const SCHEMA_VERSION: u32 = 1;
 
-/// Serialized form of [`PairingCredentials`] + event-resume continuity values
-/// + metadata. The file is written once at pair time and then rewritten each
-/// time event continuity advances.
+/// Serialized form of [`PairingCredentials`] + event-resume continuity values +
+/// metadata. The file is written once at pair time and then rewritten each time
+/// event continuity advances.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredCreds {
     #[serde(default = "default_schema_version")]
