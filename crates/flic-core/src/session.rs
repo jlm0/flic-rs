@@ -791,4 +791,21 @@ mod tests {
             .expect_err("should error");
         assert!(matches!(err, FlicError::ProtocolViolation(_)));
     }
+
+    #[test]
+    fn is_retryable_classifies_every_disconnect_reason() {
+        // Transient link-layer problems — the button is still ours, just re-handshake.
+        assert!(DisconnectReason::PingTimeout.is_retryable());
+        assert!(DisconnectReason::BleTransport("adapter_off".into()).is_retryable());
+
+        // Terminal — either the pairing is gone (InvalidSignature,
+        // StartedNewWithSamePairingId) or the user/firmware said no (ByUser,
+        // HandshakeFailed, UnknownFromButton). Retrying would burn battery without
+        // a chance of success.
+        assert!(!DisconnectReason::InvalidSignature.is_retryable());
+        assert!(!DisconnectReason::StartedNewWithSamePairingId.is_retryable());
+        assert!(!DisconnectReason::ByUser.is_retryable());
+        assert!(!DisconnectReason::HandshakeFailed("quick_verify_negative".into()).is_retryable());
+        assert!(!DisconnectReason::UnknownFromButton(99).is_retryable());
+    }
 }
