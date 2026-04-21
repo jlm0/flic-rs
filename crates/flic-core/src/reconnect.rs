@@ -183,6 +183,18 @@ mod tests {
     }
 
     #[test]
+    fn attempt_succeeded_transitions_to_listening() {
+        let mut sup = Supervisor::new(ReconnectPolicy::default());
+        sup.step(SupervisorInput::Start);
+        let actions = sup.step(SupervisorInput::AttemptSucceeded);
+        assert_eq!(sup.state(), SupervisorState::Listening);
+        assert!(
+            actions.is_empty(),
+            "no side-effects on a successful attempt — the runner is already listening"
+        );
+    }
+
+    #[test]
     fn delay_respects_custom_policy() {
         let p = ReconnectPolicy {
             initial_backoff: Duration::from_millis(100),
