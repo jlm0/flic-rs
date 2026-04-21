@@ -129,8 +129,14 @@ impl Supervisor {
     }
 
     /// Apply an input and return the resulting actions.
-    pub fn step(&mut self, _input: SupervisorInput) -> Vec<SupervisorAction> {
-        unimplemented!("supervisor step is not yet implemented")
+    pub fn step(&mut self, input: SupervisorInput) -> Vec<SupervisorAction> {
+        match (self.state, input) {
+            (SupervisorState::Idle, SupervisorInput::Start) => {
+                self.state = SupervisorState::Connecting { attempt: 1 };
+                vec![SupervisorAction::InitiateConnect]
+            }
+            _ => Vec::new(),
+        }
     }
 }
 
