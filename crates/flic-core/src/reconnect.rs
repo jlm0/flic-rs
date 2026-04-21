@@ -244,6 +244,24 @@ mod tests {
     }
 
     #[test]
+    fn fatal_failure_from_connecting_stops_supervisor() {
+        let mut sup = Supervisor::new(ReconnectPolicy::default());
+        sup.step(SupervisorInput::Start);
+        let actions = sup.step(SupervisorInput::AttemptFailed(
+            crate::session::DisconnectReason::HandshakeFailed("quick_verify_negative".into()),
+        ));
+        assert_eq!(sup.state(), SupervisorState::Stopped);
+        assert_eq!(actions.len(), 2);
+        assert!(matches!(
+            &actions[0],
+            SupervisorAction::Emit(SupervisorEvent::Stopped {
+                final_reason: Some(crate::session::DisconnectReason::HandshakeFailed(_))
+            })
+        ));
+        assert!(matches!(actions[1], SupervisorAction::Stop));
+    }
+
+    #[test]
     fn delay_respects_custom_policy() {
         let p = ReconnectPolicy {
             initial_backoff: Duration::from_millis(100),
