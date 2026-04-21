@@ -7,7 +7,9 @@
 
 use std::time::Duration;
 
-use btleplug::api::{Central, CentralEvent, Manager as _, Peripheral as _, ScanFilter, WriteType};
+use btleplug::api::{
+    Central, CentralEvent, CentralState, Manager as _, Peripheral as _, ScanFilter, WriteType,
+};
 use btleplug::platform::{Adapter, Manager, Peripheral, PeripheralId};
 use futures::stream::StreamExt;
 use tracing::info;
@@ -55,6 +57,16 @@ impl BleTransport {
     #[must_use]
     pub fn adapter(&self) -> &Adapter {
         &self.adapter
+    }
+
+    /// Reads the current BLE adapter power state. Returns
+    /// [`CentralState::Unknown`] if the underlying query fails — callers should
+    /// treat Unknown as "try anyway" rather than "give up."
+    pub async fn adapter_state(&self) -> CentralState {
+        self.adapter
+            .adapter_state()
+            .await
+            .unwrap_or(CentralState::Unknown)
     }
 
     /// Scans for Flic 2 peripherals. Filter: advertised service UUID equals the Flic
