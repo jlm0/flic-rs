@@ -289,6 +289,39 @@ pub struct FullVerifyResponse2 {
 }
 
 impl FullVerifyResponse2 {
+    /// `flags` bit 0 — the button agreed the supplied app credentials match.
+    /// Only meaningful when [`Self::cares_about_app_credentials`] is true: a
+    /// button that doesn't enforce credentials can legitimately report `false`
+    /// here without it being a handshake failure.
+    #[must_use]
+    pub fn app_credentials_match(&self) -> bool {
+        self.flags & 0x01 != 0
+    }
+
+    /// `flags` bit 1 — the button enforces app-credential matching. When this
+    /// is set and [`Self::app_credentials_match`] is not, pairing must fail.
+    #[must_use]
+    pub fn cares_about_app_credentials(&self) -> bool {
+        self.flags & 0x02 != 0
+    }
+
+    /// `flags` bit 2 — the button is a Flic Duo (Duo extension). Preserved for
+    /// callers that want to diverge behavior for Duo-specific event encodings.
+    #[must_use]
+    pub fn is_duo(&self) -> bool {
+        self.flags & 0x04 != 0
+    }
+
+    /// True iff the button actively rejected our app credentials — i.e. it
+    /// both [`cares_about_app_credentials`](Self::cares_about_app_credentials)
+    /// and signals [`app_credentials_match`](Self::app_credentials_match) is
+    /// false. A button that doesn't care about credentials returns `false`
+    /// here regardless of the match bit.
+    #[must_use]
+    pub fn credentials_rejected(&self) -> bool {
+        self.cares_about_app_credentials() && !self.app_credentials_match()
+    }
+
     /// Parses the payload (opcode already stripped).
     ///
     /// # Errors
@@ -325,13 +358,35 @@ impl FullVerifyResponse2 {
     }
 }
 
-/// Opcode 2 (from button) — `NoLogicalConnectionSlotsInd`. Unsigned; no payload.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct NoLogicalConnectionSlotsInd;
+/// Opcode 2 (from button) — `NoLogicalConnectionSlotsInd`. Unsigned.
+///
+/// Payload is a variable-length list of u32 (LE) `tmp_id` values — one per
+/// session the button is rejecting. A session is only affected if its
+/// `expected_tmp_id` appears in this list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoLogicalConnectionSlotsInd {
+    pub tmp_ids: Vec<u32>,
+}
 
 impl NoLogicalConnectionSlotsInd {
-    pub fn parse(_payload: &[u8]) -> Result<Self, FlicError> {
-        Ok(Self)
+    pub fn parse(payload: &[u8]) -> Result<Self, FlicError> {
+        if payload.len() % 4 != 0 {
+            return Err(FlicError::ProtocolViolation(format!(
+                "NoLogicalConnectionSlotsInd payload length {} is not a multiple of 4",
+                payload.len()
+            )));
+        }
+        let tmp_ids = payload
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        Ok(Self { tmp_ids })
+    }
+
+    /// True iff the given `expected_tmp_id` appears in the list.
+    #[must_use]
+    pub fn affects_tmp_id(&self, expected_tmp_id: u32) -> bool {
+        self.tmp_ids.contains(&expected_tmp_id)
     }
 }
 
@@ -832,5 +887,53 @@ mod tests {
     fn full_verify_fail_reason() {
         let parsed = FullVerifyFailResponse::parse(&[1]).expect("parse");
         assert_eq!(parsed.reason, 1);
+    }
+
+    fn full_verify_response_2_payload(flags: u8) -> Vec<u8> {
+        let mut payload = Vec::with_capacity(58);
+        payload.push(flags);
+        payload.extend_from_slice(&[0x22; 16]); // uuid
+        payload.push(0); // name_len
+        payload.extend_from_slice(&[0u8; 23]); // name
+        payload.extend_from_slice(&42u32.to_le_bytes()); // fw
+        payload.extend_from_slice(&512u16.to_le_bytes()); // batt raw
+        payload.extend_from_slice(b"BC00-A0001\0"); // 11 bytes, null-terminated
+        payload
+    }
+
+    #[test]
+    fn full_verify_response_2_flag_accessors() {
+        let mut parsed =
+            FullVerifyResponse2::parse(&full_verify_response_2_payload(0x01)).expect("parse");
+        assert!(parsed.app_credentials_match());
+        assert!(!parsed.cares_about_app_credentials());
+        assert!(!parsed.is_duo());
+
+        parsed =
+            FullVerifyResponse2::parse(&full_verify_response_2_payload(0x06)).expect("parse");
+        assert!(!parsed.app_credentials_match());
+        assert!(parsed.cares_about_app_credentials());
+        assert!(parsed.is_duo());
+
+        parsed =
+            FullVerifyResponse2::parse(&full_verify_response_2_payload(0x00)).expect("parse");
+        assert!(!parsed.app_credentials_match());
+    }
+
+    #[test]
+    fn credentials_rejected_only_when_cares_and_mismatch() {
+        let cases: &[(u8, bool, &str)] = &[
+            (0x00, false, "cares=0 match=0 — button doesn't enforce, no reject"),
+            (0x01, false, "cares=0 match=1 — button doesn't enforce, no reject"),
+            (0x02, true, "cares=1 match=0 — enforced mismatch, REJECT"),
+            (0x03, false, "cares=1 match=1 — enforced and matched, no reject"),
+            (0x06, true, "cares=1 match=0 is_duo=1 — duo also rejects on mismatch"),
+            (0x07, false, "cares=1 match=1 is_duo=1 — duo ok"),
+        ];
+        for &(flags, expected, note) in cases {
+            let parsed = FullVerifyResponse2::parse(&full_verify_response_2_payload(flags))
+                .expect("parse");
+            assert_eq!(parsed.credentials_rejected(), expected, "{note}");
+        }
     }
 }

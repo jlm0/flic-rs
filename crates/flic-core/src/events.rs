@@ -56,12 +56,15 @@ pub fn decode_press_kind(code: u8) -> PressKind {
 
 /// Whether an event code requires a subsequent `AckButtonEventsInd` to prevent replay.
 ///
-/// Per the Flic 2 spec: events that indicate a *decision* (SingleClick, DoubleClick,
-/// UpAfterHold, Hold) are stored in the button's queue and must be acknowledged. Raw
-/// down/up events aren't queued. `ClickPending` is intermediate — no ack.
+/// Per the Flic 2 base spec, the ACK condition is the encoded form for "up events
+/// with single/double click or single-click-timeout": codes 2 (`SingleClick`), 10
+/// (single-click confirmed by release), 11 (`DoubleClick`), and 14 (`UpAfterHold`).
+/// Plain `Hold` (code 3) is a threshold-crossing notification — the button does not
+/// queue it for replay and does not expect an ACK. Raw `Down`/`Up` and
+/// `ClickPending` are intermediate and likewise unACKed.
 #[must_use]
 pub fn requires_ack(code: u8) -> bool {
-    matches!(code, 2 | 3 | 10 | 11 | 14)
+    matches!(code, 2 | 10 | 11 | 14)
 }
 
 /// Convenience: decode a whole slot into a `(PressKind, u64)` tuple.
@@ -97,10 +100,14 @@ mod tests {
 
     #[test]
     fn ack_rules() {
-        for code in [2, 3, 10, 11, 14] {
+        // Per Flic 2 base spec, the ACK condition is "up events with single/double
+        // click or single-click-timeout encoded form": 2, 10, 11, 14. Plain Hold
+        // (code 3) is a threshold-crossing notification; it is not queued and
+        // therefore does not need an ACK.
+        for code in [2, 10, 11, 14] {
             assert!(requires_ack(code), "code {code} must require ack");
         }
-        for code in [0, 1, 4, 5, 6, 7, 8, 9, 12, 13, 15] {
+        for code in [0, 1, 3, 4, 5, 6, 7, 8, 9, 12, 13, 15] {
             assert!(!requires_ack(code), "code {code} must not require ack");
         }
     }

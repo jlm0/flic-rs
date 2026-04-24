@@ -339,6 +339,21 @@ impl Session {
                 SessionAction::CloseSession,
             ]);
         }
+        if op == OpcodeFromFlic::NoLogicalConnectionSlotsInd as u8 {
+            // Valid in this state per the base spec. The indication only
+            // terminates pairing if the listed tmp_ids include our session's.
+            let ind = NoLogicalConnectionSlotsInd::parse(frame.payload())?;
+            if !ind.affects_tmp_id(self.expected_tmp_id) {
+                return Ok(Vec::new());
+            }
+            self.state = State::Failed;
+            return Ok(vec![
+                SessionAction::Emit(SessionEvent::Disconnected {
+                    reason: DisconnectReason::HandshakeFailed("no_logical_connection_slots".into()),
+                }),
+                SessionAction::CloseSession,
+            ]);
+        }
         if op != OpcodeFromFlic::FullVerifyResponse1 as u8 {
             return self.unexpected_opcode(op);
         }
@@ -347,6 +362,21 @@ impl Session {
             return Err(FlicError::ProtocolViolation(
                 "FullVerifyResponse1 tmp_id mismatch".into(),
             ));
+        }
+
+        // FullVerifyResponse1 is the frame that assigns our logical connection
+        // id. The base spec requires `newly_assigned` to be set here and the
+        // assigned conn_id to be nonzero.
+        if !frame.newly_assigned || frame.conn_id == 0 {
+            self.state = State::Failed;
+            return Ok(vec![
+                SessionAction::Emit(SessionEvent::Disconnected {
+                    reason: DisconnectReason::HandshakeFailed(
+                        "FullVerifyResponse1 missing newly_assigned or assigned conn_id=0".into(),
+                    ),
+                }),
+                SessionAction::CloseSession,
+            ]);
         }
 
         // Signed message shape: button_address || address_type || button_ecdh_pub.
@@ -369,9 +399,7 @@ impl Session {
             ]);
         };
 
-        if frame.newly_assigned {
-            self.conn_id = frame.conn_id;
-        }
+        self.conn_id = frame.conn_id;
 
         let keypair = x25519::Keypair::generate();
         let shared_secret = keypair.diffie_hellman(&resp.button_ecdh_pub);
@@ -439,6 +467,25 @@ impl Session {
         self.verify_inbound_mac(op, payload, mac)?;
 
         let resp = FullVerifyResponse2::parse(payload)?;
+        if resp.credentials_rejected() {
+            // The button both enforces app-credentials and told us our
+            // credentials don't match. Per spec the session MUST terminate —
+            // pairing credentials are the root of future reconnect identity,
+            // and silently accepting a mismatch would break the handshake
+            // contract. Buttons that don't enforce credentials (bit 1 = 0)
+            // fall through unchanged; bit 0's value is not authoritative
+            // then.
+            self.state = State::Failed;
+            self.pending_paired = None;
+            return Ok(vec![
+                SessionAction::Emit(SessionEvent::Disconnected {
+                    reason: DisconnectReason::HandshakeFailed(
+                        "app_credentials_match=0 with cares_about_app_credentials=1".into(),
+                    ),
+                }),
+                SessionAction::CloseSession,
+            ]);
+        }
         let Some(mut creds) = self.pending_paired.take() else {
             return Err(FlicError::ProtocolViolation(
                 "FullVerifyResponse2 without pending credentials".into(),
@@ -473,7 +520,10 @@ impl Session {
     ) -> Result<Vec<SessionAction>, FlicError> {
         let op = frame.opcode();
         if op == OpcodeFromFlic::NoLogicalConnectionSlotsInd as u8 {
-            let _ = NoLogicalConnectionSlotsInd::parse(frame.payload())?;
+            let ind = NoLogicalConnectionSlotsInd::parse(frame.payload())?;
+            if !ind.affects_tmp_id(self.expected_tmp_id) {
+                return Ok(Vec::new());
+            }
             self.state = State::Failed;
             return Ok(vec![
                 SessionAction::Emit(SessionEvent::Disconnected {
@@ -483,7 +533,13 @@ impl Session {
             ]);
         }
         if op == OpcodeFromFlic::QuickVerifyNegativeResponse as u8 {
-            let _ = QuickVerifyNegativeResponse::parse(frame.payload())?;
+            let neg = QuickVerifyNegativeResponse::parse(frame.payload())?;
+            // Per spec, the negative response is only authoritative when its
+            // tmp_id matches our session's tmp_id. Otherwise it is stale or
+            // spoofed — drop it and keep waiting.
+            if neg.tmp_id != self.expected_tmp_id {
+                return Ok(Vec::new());
+            }
             self.state = State::Failed;
             return Ok(vec![
                 SessionAction::Emit(SessionEvent::Disconnected {
@@ -508,12 +564,33 @@ impl Session {
         };
 
         let (payload, mac) = frame.split_signed()?;
+        let resp = QuickVerifyResponse::parse(payload)?;
+
+        // Drop packets that don't match our session's tmp_id before doing any
+        // crypto: tmp-id matching is what binds this unauthenticated early
+        // packet to this session.
+        if resp.tmp_id != self.expected_tmp_id {
+            return Ok(Vec::new());
+        }
+
+        // The positive response carries the logical connection assignment; if
+        // it isn't marked `newly_assigned` the handshake is malformed.
+        if !frame.newly_assigned {
+            self.state = State::Failed;
+            return Ok(vec![
+                SessionAction::Emit(SessionEvent::Disconnected {
+                    reason: DisconnectReason::HandshakeFailed(
+                        "QuickVerifyResponse without newly_assigned".into(),
+                    ),
+                }),
+                SessionAction::CloseSession,
+            ]);
+        }
 
         // Derive session_key = Chaskey(pairing_key, client_random[7] || flags || button_random[8]).
         // The middle byte is the flags byte we sent in the QuickVerifyRequest — must match
         // bit-for-bit. We always send `supports_duo = 1` (0x40); keep the two in lockstep.
         let subkeys_from_pairing = chaskey::generate_subkeys(&creds.pairing_key);
-        let resp = QuickVerifyResponse::parse(payload)?;
         let mut block = [0u8; 16];
         block[..7].copy_from_slice(&client_random);
         block[7] = QUICK_VERIFY_FLAGS;
@@ -526,10 +603,7 @@ impl Session {
 
         self.verify_inbound_mac(op, payload, mac)?;
 
-        if frame.newly_assigned {
-            self.conn_id = frame.conn_id;
-        }
-
+        self.conn_id = frame.conn_id;
         self.counter_from_button = self.counter_from_button.wrapping_add(1);
 
         let mut actions = Vec::new();
@@ -607,31 +681,7 @@ impl Session {
         }
         if op == OpcodeFromFlic::ButtonEventNotification as u8 {
             let notif = ButtonEventNotification::parse(payload)?;
-            let mut actions = Vec::new();
-            let mut last_ack_count: Option<u32> = None;
-            let base_count = notif.event_count;
-            for (i, slot) in notif.events.iter().enumerate() {
-                let kind = decode_press_kind(slot.event_code);
-                actions.push(SessionAction::Emit(SessionEvent::ButtonPressed {
-                    kind,
-                    timestamp_32k: slot.timestamp_32k,
-                    was_queued: slot.was_queued,
-                }));
-                if requires_ack(slot.event_code) {
-                    // The final event_count in the notification is for the last event;
-                    // we assume sequential numbering for intermediate events.
-                    last_ack_count = Some(base_count.wrapping_add(i as u32));
-                }
-            }
-            if let Some(count) = last_ack_count {
-                let ack_body = AckButtonEventsInd { event_count: count }.write();
-                let signed = self.sign_outbound(&ack_body)?;
-                for pkt in frame::encode_frame(self.conn_id, false, &signed) {
-                    actions.push(SessionAction::WritePacket(pkt));
-                }
-                self.record_acked_events(count);
-            }
-            return Ok(actions);
+            return self.handle_button_event_notification(&notif);
         }
         if op == OpcodeFromFlic::DisconnectedVerifiedLinkInd as u8 {
             let resp = DisconnectedVerifiedLinkInd::parse(payload)?;
@@ -653,6 +703,40 @@ impl Session {
         // the session for opcodes we didn't implement).
         tracing::debug!(opcode = op, "unhandled opcode in SessionEstablished");
         Ok(Vec::new())
+    }
+
+    /// Processes a parsed `ButtonEventNotification`, updating persistent resume
+    /// state and (when required) emitting a signed `AckButtonEventsInd`.
+    fn handle_button_event_notification(
+        &mut self,
+        notif: &ButtonEventNotification,
+    ) -> Result<Vec<SessionAction>, FlicError> {
+        let plan = plan_button_event_actions(notif);
+        let mut actions: Vec<SessionAction> = plan
+            .press_events
+            .into_iter()
+            .map(SessionAction::Emit)
+            .collect();
+        // Persist resume state on every notification — the base spec requires
+        // storage to be updated with the packet's event_count after button
+        // events are processed, regardless of whether we ACK.
+        self.record_acked_events(notif.event_count);
+        if plan.should_ack {
+            // One ACK per notification. Per spec, the ACK's event_count is the
+            // same value as the ButtonEventNotification's event_count (which
+            // corresponds to the LAST event in the slot array — intermediate
+            // counts are not sequential because hold/timeout events can be
+            // skipped).
+            let ack_body = AckButtonEventsInd {
+                event_count: notif.event_count,
+            }
+            .write();
+            let signed = self.sign_outbound(&ack_body)?;
+            for pkt in frame::encode_frame(self.conn_id, false, &signed) {
+                actions.push(SessionAction::WritePacket(pkt));
+            }
+        }
+        Ok(actions)
     }
 
     // ----- helpers -----
@@ -726,6 +810,16 @@ impl Session {
             State::Failed => "Failed",
         }
     }
+
+    /// Test helper — force the session into `SessionEstablished` with a fixed
+    /// chaskey subkey so handlers that sign outbound frames can run without
+    /// completing the real handshake.
+    #[cfg(test)]
+    fn test_force_established(&mut self, pairing_key: [u8; 16]) {
+        self.state = State::SessionEstablished;
+        self.chaskey_subkeys = Some(crate::crypto::chaskey::generate_subkeys(&pairing_key));
+        self.counter_to_button = 0;
+    }
 }
 
 impl Default for Session {
@@ -738,6 +832,40 @@ fn random_u32() -> u32 {
     let mut buf = [0u8; 4];
     OsRng.fill_bytes(&mut buf);
     u32::from_le_bytes(buf)
+}
+
+/// Pure decision over a `ButtonEventNotification`.
+///
+/// Returns the `ButtonPressed` emissions the session should surface and whether
+/// the notification needs an ACK. Per the Flic 2 base spec:
+///
+/// - Only one ACK per notification, regardless of how many slots are carried.
+/// - The ACK's `event_count` is the notification's `event_count` — which per
+///   the spec corresponds to the **last** event in the array. Hold and
+///   single-click-timeout events may be skipped, so intermediate event counts
+///   cannot be derived from slot index.
+/// - The ACK fires only if at least one slot carries an event code listed in
+///   [`requires_ack`] (2, 10, 11, 14).
+struct ButtonEventPlan {
+    press_events: Vec<SessionEvent>,
+    should_ack: bool,
+}
+
+fn plan_button_event_actions(notif: &ButtonEventNotification) -> ButtonEventPlan {
+    let press_events = notif
+        .events
+        .iter()
+        .map(|slot| SessionEvent::ButtonPressed {
+            kind: decode_press_kind(slot.event_code),
+            timestamp_32k: slot.timestamp_32k,
+            was_queued: slot.was_queued,
+        })
+        .collect();
+    let should_ack = notif.events.iter().any(|s| requires_ack(s.event_code));
+    ButtonEventPlan {
+        press_events,
+        should_ack,
+    }
 }
 
 #[cfg(test)]
@@ -907,6 +1035,328 @@ mod tests {
         let state = sess.resume_state();
         assert_eq!(state.event_count, 42);
         assert_eq!(state.boot_id, 0);
+    }
+
+    fn slot(event_code: u8) -> crate::protocol::messages::ButtonEventSlot {
+        crate::protocol::messages::ButtonEventSlot {
+            timestamp_32k: 0,
+            event_code,
+            was_queued: false,
+            was_queued_last: false,
+        }
+    }
+
+    #[test]
+    fn plan_button_events_multi_slot_two_ack_worthy_sends_one_ack() {
+        // Two ACK-worthy events (code 2 = SingleClick) plus one raw Down (code 1).
+        // Spec: one ACK per notification, value is the packet's event_count,
+        // NOT slot-index-derived.
+        let notif = ButtonEventNotification {
+            event_count: 987,
+            events: vec![slot(1), slot(2), slot(2)],
+        };
+        let plan = plan_button_event_actions(&notif);
+        assert_eq!(plan.press_events.len(), 3);
+        assert!(
+            plan.should_ack,
+            "any slot with an ACK-worthy code requires ACK"
+        );
+    }
+
+    #[test]
+    fn plan_button_events_only_down_does_not_require_ack() {
+        let notif = ButtonEventNotification {
+            event_count: 42,
+            events: vec![slot(1), slot(1)],
+        };
+        let plan = plan_button_event_actions(&notif);
+        assert_eq!(plan.press_events.len(), 2);
+        assert!(
+            !plan.should_ack,
+            "plain Down events are intermediate and never ACKed"
+        );
+    }
+
+    #[test]
+    fn plan_button_events_hold_code_3_does_not_require_ack() {
+        // Regression against the prior implementation that included code 3.
+        let notif = ButtonEventNotification {
+            event_count: 10,
+            events: vec![slot(3)],
+        };
+        let plan = plan_button_event_actions(&notif);
+        assert!(!plan.should_ack, "plain Hold (code 3) is not ACKed");
+    }
+
+    #[test]
+    fn plan_button_events_up_after_hold_code_14_requires_ack() {
+        // UpAfterHold (code 14) has type=0 (up) and single-click bit set,
+        // matching the base-spec ACK condition.
+        let notif = ButtonEventNotification {
+            event_count: 1,
+            events: vec![slot(14)],
+        };
+        let plan = plan_button_event_actions(&notif);
+        assert!(plan.should_ack);
+    }
+
+    #[test]
+    fn button_event_ack_uses_packet_event_count_not_slot_index() {
+        let mut sess = Session::new();
+        sess.test_force_established([0xAA; 16]);
+        let notif = ButtonEventNotification {
+            event_count: 987,
+            events: vec![slot(2), slot(2), slot(2)],
+        };
+        let actions = sess.handle_button_event_notification(&notif).expect("ok");
+
+        // Three ButtonPressed emits + exactly one AckButtonEventsInd write.
+        let writes: Vec<&Vec<u8>> = actions
+            .iter()
+            .filter_map(|a| match a {
+                SessionAction::WritePacket(p) => Some(p),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(writes.len(), 1, "exactly one ACK packet per notification");
+        let ack = writes[0];
+        // ack layout: [ctrl(1), opcode(1), event_count(4 LE), mac(5)] = 11 bytes
+        assert_eq!(ack.len(), 11);
+        assert_eq!(ack[1], AckButtonEventsInd::OPCODE);
+        let ack_count = u32::from_le_bytes([ack[2], ack[3], ack[4], ack[5]]);
+        assert_eq!(
+            ack_count, 987,
+            "ACK carries the packet's event_count, not a slot-derived value"
+        );
+    }
+
+    #[test]
+    fn button_event_resume_state_advances_even_without_ack() {
+        // Notification full of Down events — no ACK, but storage must advance
+        // so a reconnect does not replay events the host already saw.
+        let mut sess = Session::new();
+        sess.test_force_established([0xBB; 16]);
+        sess.record_events_resumed(100, 7); // prior state
+
+        let notif = ButtonEventNotification {
+            event_count: 150,
+            events: vec![slot(1), slot(1), slot(1)],
+        };
+        let actions = sess.handle_button_event_notification(&notif).expect("ok");
+
+        let writes = actions
+            .iter()
+            .filter(|a| matches!(a, SessionAction::WritePacket(_)))
+            .count();
+        assert_eq!(writes, 0, "Down-only notifications do not ACK");
+
+        let resume = sess.resume_state();
+        assert_eq!(resume.event_count, 150, "resume state advances without ACK");
+        assert_eq!(resume.boot_id, 7, "boot_id is invariant across notifications");
+    }
+
+    /// Build a FullVerifyResponse1 incoming packet with the given `tmp_id` and
+    /// control flags. Signature/crypto payloads are arbitrary bytes; tests
+    /// using this helper rely on the session failing the newly_assigned /
+    /// conn_id check before Ed25519 verification runs.
+    fn full_verify_response_1_packet(
+        tmp_id: u32,
+        conn_id: u8,
+        newly_assigned: bool,
+    ) -> Vec<u8> {
+        let mut pkt = Vec::with_capacity(1 + 1 + 116);
+        let ctrl = (conn_id & 0x1F) | if newly_assigned { 0x20 } else { 0x00 };
+        pkt.push(ctrl);
+        pkt.push(OpcodeFromFlic::FullVerifyResponse1 as u8);
+        pkt.extend_from_slice(&tmp_id.to_le_bytes()); // 4
+        pkt.extend_from_slice(&[0u8; 64]); // signature
+        pkt.extend_from_slice(&[0u8; 6]); // addr
+        pkt.push(0); // addr type
+        pkt.extend_from_slice(&[0u8; 32]); // ecdh
+        pkt.extend_from_slice(&[0u8; 8]); // device_random
+        pkt.push(0); // flags
+        pkt
+    }
+
+    fn no_logical_connection_slots_packet(tmp_ids: &[u32]) -> Vec<u8> {
+        let mut pkt = Vec::with_capacity(1 + 1 + tmp_ids.len() * 4);
+        pkt.push(0x00);
+        pkt.push(OpcodeFromFlic::NoLogicalConnectionSlotsInd as u8);
+        for id in tmp_ids {
+            pkt.extend_from_slice(&id.to_le_bytes());
+        }
+        pkt
+    }
+
+    #[test]
+    fn full_verify_1_without_newly_assigned_fails_handshake() {
+        let mut sess = Session::new();
+        sess.step(SessionInput::BeginPairing).expect("ok");
+        let tmp = sess.expected_tmp_id;
+        // conn_id=1 but newly_assigned=false → must fail.
+        let pkt = full_verify_response_1_packet(tmp, 1, false);
+        let actions = sess.step(SessionInput::IncomingPacket(pkt)).expect("ok");
+        assert_eq!(sess.state_name(), "Failed");
+        let ok = actions.iter().any(|a| {
+            matches!(
+                a,
+                SessionAction::Emit(SessionEvent::Disconnected {
+                    reason: DisconnectReason::HandshakeFailed(_),
+                })
+            )
+        });
+        assert!(ok);
+    }
+
+    #[test]
+    fn full_verify_1_with_zero_conn_id_fails_handshake() {
+        let mut sess = Session::new();
+        sess.step(SessionInput::BeginPairing).expect("ok");
+        let tmp = sess.expected_tmp_id;
+        // conn_id=0 with newly_assigned set → still invalid per spec.
+        let pkt = full_verify_response_1_packet(tmp, 0, true);
+        sess.step(SessionInput::IncomingPacket(pkt)).expect("ok");
+        assert_eq!(sess.state_name(), "Failed");
+    }
+
+    #[test]
+    fn full_verify_1_no_logical_connection_slots_with_matching_tmp_id_fails() {
+        let mut sess = Session::new();
+        sess.step(SessionInput::BeginPairing).expect("ok");
+        let tmp = sess.expected_tmp_id;
+        let pkt = no_logical_connection_slots_packet(&[0xDEAD_BEEF, tmp, 0x1234]);
+        sess.step(SessionInput::IncomingPacket(pkt)).expect("ok");
+        assert_eq!(sess.state_name(), "Failed");
+    }
+
+    #[test]
+    fn full_verify_1_no_logical_connection_slots_without_matching_tmp_id_is_ignored() {
+        let mut sess = Session::new();
+        sess.step(SessionInput::BeginPairing).expect("ok");
+        let tmp = sess.expected_tmp_id;
+        // A list not containing our tmp_id → ignore.
+        let other = tmp.wrapping_add(1);
+        let pkt = no_logical_connection_slots_packet(&[other, other.wrapping_add(7)]);
+        let actions = sess.step(SessionInput::IncomingPacket(pkt)).expect("ok");
+        assert!(actions.is_empty());
+        assert_eq!(sess.state_name(), "WaitFullVerify1");
+    }
+
+    fn test_creds() -> PairingCredentials {
+        PairingCredentials {
+            pairing_id: 0xCAFE_BABE,
+            pairing_key: [0x11; 16],
+            serial_number: "BC00-A00001".into(),
+            button_uuid: [0x22; 16],
+            firmware_version: 7,
+        }
+    }
+
+    /// Build an incoming QuickVerifyResponse packet with the given tmp_id and
+    /// newly_assigned flag. MAC bytes are arbitrary — tests that rely on this
+    /// helper are expected to fail the tmp_id or newly_assigned check BEFORE
+    /// any MAC verification runs.
+    fn quick_verify_positive_packet(tmp_id: u32, newly_assigned: bool) -> Vec<u8> {
+        let mut pkt = Vec::new();
+        let ctrl = if newly_assigned { 0x20 } else { 0x00 };
+        pkt.push(ctrl);
+        pkt.push(OpcodeFromFlic::QuickVerifyResponse as u8);
+        pkt.extend_from_slice(&[0xAA; 8]); // button_random
+        pkt.extend_from_slice(&tmp_id.to_le_bytes());
+        pkt.push(0x40); // flags
+        pkt.extend_from_slice(&[0u8; 5]); // mac placeholder
+        pkt
+    }
+
+    fn quick_verify_negative_packet(tmp_id: u32) -> Vec<u8> {
+        let mut pkt = Vec::new();
+        pkt.push(0x00);
+        pkt.push(OpcodeFromFlic::QuickVerifyNegativeResponse as u8);
+        pkt.extend_from_slice(&tmp_id.to_le_bytes());
+        pkt
+    }
+
+    #[test]
+    fn quick_verify_positive_with_mismatched_tmp_id_is_ignored() {
+        let mut sess = Session::new();
+        sess.step(SessionInput::BeginReconnect(
+            test_creds(),
+            EventResumeState::default(),
+        ))
+        .expect("ok");
+        assert_eq!(sess.state_name(), "WaitQuickVerify");
+        let expected = sess.expected_tmp_id;
+
+        // Use a tmp_id that cannot equal the session's (flip all bits).
+        let spoof = quick_verify_positive_packet(!expected, true);
+        let actions = sess.step(SessionInput::IncomingPacket(spoof)).expect("ok");
+        assert!(
+            actions.is_empty(),
+            "mismatched tmp_id must not produce any actions"
+        );
+        assert_eq!(
+            sess.state_name(),
+            "WaitQuickVerify",
+            "state must not transition on spoofed positive"
+        );
+    }
+
+    #[test]
+    fn quick_verify_negative_with_mismatched_tmp_id_is_ignored() {
+        let mut sess = Session::new();
+        sess.step(SessionInput::BeginReconnect(
+            test_creds(),
+            EventResumeState::default(),
+        ))
+        .expect("ok");
+        let expected = sess.expected_tmp_id;
+        let spoof = quick_verify_negative_packet(!expected);
+        let actions = sess.step(SessionInput::IncomingPacket(spoof)).expect("ok");
+        assert!(actions.is_empty());
+        assert_eq!(sess.state_name(), "WaitQuickVerify");
+    }
+
+    #[test]
+    fn quick_verify_negative_with_matching_tmp_id_terminates_session() {
+        let mut sess = Session::new();
+        sess.step(SessionInput::BeginReconnect(
+            test_creds(),
+            EventResumeState::default(),
+        ))
+        .expect("ok");
+        let expected = sess.expected_tmp_id;
+        let pkt = quick_verify_negative_packet(expected);
+        let actions = sess.step(SessionInput::IncomingPacket(pkt)).expect("ok");
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, SessionAction::CloseSession)),
+            "matching negative must close"
+        );
+        assert_eq!(sess.state_name(), "Failed");
+    }
+
+    #[test]
+    fn quick_verify_positive_without_newly_assigned_fails_handshake() {
+        let mut sess = Session::new();
+        sess.step(SessionInput::BeginReconnect(
+            test_creds(),
+            EventResumeState::default(),
+        ))
+        .expect("ok");
+        let expected = sess.expected_tmp_id;
+        let pkt = quick_verify_positive_packet(expected, false);
+        let actions = sess.step(SessionInput::IncomingPacket(pkt)).expect("ok");
+        assert_eq!(sess.state_name(), "Failed");
+        let has_handshake_fail = actions.iter().any(|a| {
+            matches!(
+                a,
+                SessionAction::Emit(SessionEvent::Disconnected {
+                    reason: DisconnectReason::HandshakeFailed(_),
+                })
+            )
+        });
+        assert!(has_handshake_fail, "missing newly_assigned must fail");
     }
 
     #[test]

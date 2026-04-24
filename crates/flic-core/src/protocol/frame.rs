@@ -87,10 +87,17 @@ impl RawFrame {
 /// Returns a `Vec<Vec<u8>>` where each inner `Vec` is one packet to write onto the
 /// write characteristic.
 ///
-/// Fragmentation: if the full packet exceeds [`FLIC_MAX_PACKET_SIZE`] (default 129
-/// bytes), split into chunks. The first N-1 fragments set [`FRAGMENT_FLAG`]; the last
-/// clears it. Each fragment repeats the conn_id + newly_assigned bits in its control
-/// byte so the receiver knows which logical connection they belong to.
+/// Fragmentation: if the body doesn't fit alongside the control byte within
+/// [`FLIC_MAX_PACKET_SIZE`] (default 129 bytes per ATT packet), split into chunks.
+/// The first N-1 fragments set [`FRAGMENT_FLAG`]; the last clears it. Each fragment
+/// repeats the conn_id + newly_assigned bits in its control byte so the receiver
+/// knows which logical connection they belong to.
+///
+/// Body size contract: per the Flic 2 base spec, a non-multipacket reassembled
+/// frame (opcode + data + signature) must not exceed [`FLIC_MAX_PACKET_SIZE`]
+/// bytes. Callers MUST NOT pass a `body` longer than that — larger frames
+/// require the multipacket framing (control bit 6) which this crate does not
+/// implement. The [`Reassembler`] enforces the same cap on the receive path.
 ///
 /// [`FRAGMENT_FLAG`]: crate::constants::frame::FRAGMENT_FLAG
 #[must_use]
@@ -177,13 +184,26 @@ impl Reassembler {
     ///
     /// # Errors
     ///
-    /// Returns [`FlicError::ProtocolViolation`] if the packet is empty or shorter than
-    /// 2 bytes when starting a fresh frame (no opcode).
+    /// Returns [`FlicError::ProtocolViolation`] if the packet is empty, if its
+    /// control byte sets the MULTI_PACKET bit (bit 6 — not implemented in this
+    /// layer), or if fragment reassembly would exceed
+    /// [`FLIC_MAX_PACKET_SIZE`] bytes of body (opcode + data + signature). An
+    /// oversize reassembly resets the internal buffer to a clean state so the
+    /// next frame can start fresh.
     pub fn feed(&mut self, packet: &[u8]) -> Result<Option<RawFrame>, FlicError> {
         if packet.is_empty() {
             return Err(FlicError::ProtocolViolation("empty packet".into()));
         }
         let control = packet[0];
+        if (control & flags::MULTI_PACKET) != 0 {
+            // Multipacket framing (bit 6) is optional per spec; we do not
+            // implement it. Rejecting is required to avoid misinterpreting an
+            // unsupported frame form as an ordinary fragment.
+            self.reset();
+            return Err(FlicError::ProtocolViolation(
+                "multipacket framing (control bit 6) is not supported".into(),
+            ));
+        }
         let is_fragment = (control & flags::FRAGMENT_FLAG) != 0;
         let conn_id = control & flags::CONN_ID_MASK;
         let newly_assigned = (control & flags::NEWLY_ASSIGNED) != 0;
@@ -192,6 +212,12 @@ impl Reassembler {
         if self.expecting_more {
             // Continuation fragment — append body regardless of control byte's conn_id
             // (the button echoes it but we use the first fragment's identity).
+            if self.buffer.len() + body.len() > FLIC_MAX_PACKET_SIZE {
+                self.reset();
+                return Err(FlicError::ProtocolViolation(format!(
+                    "reassembled frame body exceeds FLIC_MAX_PACKET_SIZE ({FLIC_MAX_PACKET_SIZE})"
+                )));
+            }
             self.buffer.extend_from_slice(body);
             if !is_fragment {
                 let mut out_body = Vec::new();
@@ -208,6 +234,11 @@ impl Reassembler {
             }
             Ok(None)
         } else if is_fragment {
+            if body.len() > FLIC_MAX_PACKET_SIZE {
+                return Err(FlicError::ProtocolViolation(format!(
+                    "first fragment body exceeds FLIC_MAX_PACKET_SIZE ({FLIC_MAX_PACKET_SIZE})"
+                )));
+            }
             self.held_conn_id = conn_id;
             self.held_newly_assigned = newly_assigned;
             self.buffer.clear();
@@ -215,6 +246,11 @@ impl Reassembler {
             self.expecting_more = true;
             Ok(None)
         } else {
+            if body.len() > FLIC_MAX_PACKET_SIZE {
+                return Err(FlicError::ProtocolViolation(format!(
+                    "single frame body exceeds FLIC_MAX_PACKET_SIZE ({FLIC_MAX_PACKET_SIZE})"
+                )));
+            }
             let frame = RawFrame {
                 conn_id,
                 newly_assigned,
@@ -351,6 +387,71 @@ mod tests {
             body: vec![0x0C, 0xDE, 0xAD, 0xBE], // no room for 5-byte MAC
         };
         assert!(frame.split_signed().is_err());
+    }
+
+    #[test]
+    fn reassemble_handles_max_legal_fragmented_body() {
+        // A 125-byte body fragmented across a tiny per-packet MTU reassembles
+        // back to the original. Proves the 129-byte cap does not reject
+        // legitimate fragmented frames under the spec's non-multipacket limit.
+        let body: Vec<u8> = (0..125u8).collect();
+        let packets = encode_frame_with_mtu(0x03, false, &body, 50);
+        assert!(
+            packets.len() >= 2,
+            "body=125 with mtu=50 should produce multiple fragments"
+        );
+
+        let mut r = Reassembler::new();
+        let mut got: Option<RawFrame> = None;
+        for pkt in &packets {
+            if let Some(f) = r.feed(pkt).expect("ok") {
+                got = Some(f);
+            }
+        }
+        let frame = got.expect("reassembly must complete");
+        assert_eq!(frame.body, body);
+    }
+
+    #[test]
+    fn reassemble_rejects_multipacket_bit() {
+        let mut r = Reassembler::new();
+        // Control byte 0x40 = MULTI_PACKET set, no fragment, conn_id 0.
+        let err = r
+            .feed(&[0x40, 0x08, 0xAA])
+            .expect_err("multipacket must be rejected");
+        assert!(matches!(err, FlicError::ProtocolViolation(_)));
+    }
+
+    #[test]
+    fn reassemble_rejects_oversized_continuation() {
+        let mut r = Reassembler::new();
+        // First fragment: 100 body bytes, fragment flag set, conn_id 1.
+        let mut first = Vec::with_capacity(101);
+        first.push(0x80 | 0x01); // fragment + conn_id=1
+        first.extend(std::iter::repeat_n(0xAB, 100));
+        assert!(r.feed(&first).expect("ok").is_none());
+
+        // Second fragment: 50 body bytes — 100 + 50 = 150 > 129 cap.
+        let mut second = Vec::with_capacity(51);
+        second.push(0x01); // last fragment, conn_id=1
+        second.extend(std::iter::repeat_n(0xCD, 50));
+        let err = r
+            .feed(&second)
+            .expect_err("reassembly past cap must error");
+        assert!(matches!(err, FlicError::ProtocolViolation(_)));
+        // After overflow, the buffer should be reset so the next frame starts clean.
+        assert!(!r.expecting_more);
+        assert!(r.buffer.is_empty());
+    }
+
+    #[test]
+    fn reassemble_rejects_oversized_single_frame() {
+        let mut r = Reassembler::new();
+        let mut pkt = Vec::with_capacity(1 + FLIC_MAX_PACKET_SIZE + 1);
+        pkt.push(0x00); // not a fragment
+        pkt.extend(std::iter::repeat_n(0xAA, FLIC_MAX_PACKET_SIZE + 1));
+        let err = r.feed(&pkt).expect_err("oversize body must error");
+        assert!(matches!(err, FlicError::ProtocolViolation(_)));
     }
 
     #[test]
