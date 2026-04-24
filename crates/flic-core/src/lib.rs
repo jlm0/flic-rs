@@ -49,6 +49,7 @@ pub mod constants;
 pub mod crypto;
 pub mod error;
 pub mod events;
+pub mod hex;
 pub mod manager;
 pub mod protocol;
 pub mod reconnect;

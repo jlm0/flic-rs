@@ -8,14 +8,12 @@
 //! - `listen <id> --creds <path>` — reconnects via QuickVerify and prints events,
 //!   with automatic reconnect + persisted event continuity
 
-#![allow(clippy::too_many_lines)]
-
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use flic_core::manager::{FlicEvent, FlicManager};
-use flic_core::{AdapterState, ReconnectPolicy};
+use flic_core::{AdapterState, EventResumeState, ReconnectPolicy};
 use tokio::sync::broadcast::error::RecvError;
 use tracing::{error, info};
 
@@ -91,28 +89,21 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             peripheral_id,
             creds,
         } => listen(&peripheral_id, &creds).await,
-        Command::Forget { creds, yes } => forget(&creds, yes).await,
+        Command::Forget { creds, yes } => forget(&creds, yes),
     }
 }
 
 async fn doctor() -> anyhow::Result<()> {
-    let manager = match FlicManager::new().await {
-        Ok(m) => m,
-        Err(e) => {
-            error!(%e, "BLE adapter unavailable");
-            println!("ERROR: {e}");
-            std::process::exit(1);
-        }
-    };
+    let manager = FlicManager::new()
+        .await
+        .map_err(|e| anyhow::anyhow!("BLE adapter unavailable: {e}"))?;
     let state = manager.adapter_state().await;
     if state == AdapterState::PoweredOn {
         info!("BLE adapter powered on");
         println!("OK: BLE adapter powered on");
         Ok(())
     } else {
-        error!(?state, "BLE adapter not powered on");
-        println!("ERROR: BLE adapter not powered on (state: {state:?})");
-        std::process::exit(1);
+        anyhow::bail!("BLE adapter not powered on (state: {state:?})")
     }
 }
 
@@ -131,14 +122,8 @@ async fn scan(seconds: u64) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn forget(creds_path: &Path, skip_confirm: bool) -> anyhow::Result<()> {
-    let stored = match creds::read(creds_path) {
-        Ok(s) => s,
-        Err(e) => {
-            println!("ERROR: cannot read {}: {e}", creds_path.display());
-            std::process::exit(1);
-        }
-    };
+fn forget(creds_path: &Path, skip_confirm: bool) -> anyhow::Result<()> {
+    let stored = creds::read(creds_path)?;
 
     println!("About to forget this pairing:");
     println!("  serial        {}", stored.serial_number);
@@ -174,9 +159,12 @@ async fn forget(creds_path: &Path, skip_confirm: bool) -> anyhow::Result<()> {
 
 async fn pair(peripheral_id: &str, out: &Path) -> anyhow::Result<()> {
     let manager = FlicManager::new().await?;
-    println!("Hold the Flic button for ~7 seconds until the LED flashes rapidly and");
-    println!("you see two extra flashes AFTER you release it. That's Public Mode —");
-    println!("you have ~30 seconds to pair. Starting scan now...");
+    // Flic 2 has no LED, beep, or haptic — no on-button feedback to rely on.
+    // Instructions here intentionally reference only observable behavior
+    // (time the hold, watch the CLI).
+    println!("Hold the Flic button for ~7 seconds — count by the clock; there is no");
+    println!("LED or beep. When you release, the button enters Public Mode for ~30");
+    println!("seconds and this command will report once it's picked up over BLE.");
     info!(id = peripheral_id, "waiting for Public-Mode advertisement");
     let target = manager.find(peripheral_id, Duration::from_secs(30)).await?;
     let pairing = manager.pair(&target.id).await?;
@@ -264,7 +252,7 @@ impl DrainerHandle {
 }
 
 fn spawn_drainer(
-    mut resume_rx: tokio::sync::watch::Receiver<flic_core::EventResumeState>,
+    mut resume_rx: tokio::sync::watch::Receiver<EventResumeState>,
     creds_path: PathBuf,
     mut stored: StoredCreds,
 ) -> DrainerHandle {
@@ -278,37 +266,18 @@ fn spawn_drainer(
         loop {
             tokio::select! {
                 _ = shutdown_rx.recv() => {
-                    let latest = *resume_rx.borrow();
-                    if latest.event_count != last_written.event_count
-                        || latest.boot_id != last_written.boot_id
-                    {
-                        stored.update_resume(latest);
-                        if let Err(e) = creds::write_atomic(&stored, &creds_path) {
-                            error!(?e, "final creds write failed");
-                        }
-                    }
+                    flush_resume(*resume_rx.borrow(), last_written, &mut stored, &creds_path);
                     return;
                 }
                 _ = ticker.tick() => {
                     let latest = *resume_rx.borrow();
-                    if latest.event_count == last_written.event_count
-                        && latest.boot_id == last_written.boot_id
-                    {
-                        continue;
-                    }
-                    stored.update_resume(latest);
-                    match creds::write_atomic(&stored, &creds_path) {
-                        Ok(()) => {
-                            last_written = latest;
-                            info!(
-                                event_count = latest.event_count,
-                                boot_id = latest.boot_id,
-                                "creds file updated"
-                            );
-                        }
-                        Err(e) => {
-                            error!(?e, "creds write failed — will retry on next tick");
-                        }
+                    if flush_resume(latest, last_written, &mut stored, &creds_path) {
+                        last_written = latest;
+                        info!(
+                            event_count = latest.event_count,
+                            boot_id = latest.boot_id,
+                            "creds file updated"
+                        );
                     }
                 }
                 change = resume_rx.changed() => {
@@ -317,15 +286,7 @@ fn spawn_drainer(
                     // supervisor exits the channel closes, and we must final-
                     // flush before returning or the last few events are lost.
                     if change.is_err() {
-                        let latest = *resume_rx.borrow();
-                        if latest.event_count != last_written.event_count
-                            || latest.boot_id != last_written.boot_id
-                        {
-                            stored.update_resume(latest);
-                            if let Err(e) = creds::write_atomic(&stored, &creds_path) {
-                                error!(?e, "final creds write failed");
-                            }
-                        }
+                        flush_resume(*resume_rx.borrow(), last_written, &mut stored, &creds_path);
                         return;
                     }
                 }
@@ -333,6 +294,28 @@ fn spawn_drainer(
         }
     });
     DrainerHandle { task, shutdown_tx }
+}
+
+/// Writes `latest` to disk if it differs from `last_written`. Returns `true`
+/// when a write succeeded so the caller can advance `last_written`; returns
+/// `false` on no-op or write failure (error is logged).
+fn flush_resume(
+    latest: EventResumeState,
+    last_written: EventResumeState,
+    stored: &mut StoredCreds,
+    path: &Path,
+) -> bool {
+    if latest.event_count == last_written.event_count && latest.boot_id == last_written.boot_id {
+        return false;
+    }
+    stored.update_resume(latest);
+    match creds::write_atomic(stored, path) {
+        Ok(()) => true,
+        Err(e) => {
+            error!(?e, "creds write failed");
+            false
+        }
+    }
 }
 
 fn print_event(event: &FlicEvent) {
