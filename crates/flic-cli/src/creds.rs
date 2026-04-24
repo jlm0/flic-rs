@@ -3,7 +3,7 @@
 
 use std::path::Path;
 
-use flic_core::{EventResumeState, PairingCredentials};
+use flic_core::{hex, EventResumeState, PairingCredentials};
 use serde::{Deserialize, Serialize};
 
 /// Current on-disk schema version. Bump when the shape changes incompatibly.
@@ -42,9 +42,9 @@ impl StoredCreds {
         Self {
             schema_version: SCHEMA_VERSION,
             pairing_id: creds.pairing_id,
-            pairing_key_hex: hex_encode(&creds.pairing_key),
+            pairing_key_hex: hex::encode(&creds.pairing_key),
             serial_number: creds.serial_number.clone(),
-            button_uuid_hex: hex_encode(&creds.button_uuid),
+            button_uuid_hex: hex::encode(&creds.button_uuid),
             firmware_version: creds.firmware_version,
             peripheral_id: peripheral_id.to_string(),
             resume_event_count: 0,
@@ -54,8 +54,10 @@ impl StoredCreds {
     }
 
     pub fn to_pairing(&self) -> anyhow::Result<PairingCredentials> {
-        let pairing_key = hex_decode_fixed::<16>(&self.pairing_key_hex)?;
-        let button_uuid = hex_decode_fixed::<16>(&self.button_uuid_hex)?;
+        let pairing_key = hex::decode_fixed::<16>(&self.pairing_key_hex)
+            .ok_or_else(|| anyhow::anyhow!("pairing_key_hex is not 32 lowercase hex chars"))?;
+        let button_uuid = hex::decode_fixed::<16>(&self.button_uuid_hex)
+            .ok_or_else(|| anyhow::anyhow!("button_uuid_hex is not 32 lowercase hex chars"))?;
         Ok(PairingCredentials {
             pairing_id: self.pairing_id,
             pairing_key,
@@ -109,26 +111,6 @@ pub fn read(path: &Path) -> anyhow::Result<StoredCreds> {
     let creds: StoredCreds = serde_json::from_str(&raw)
         .with_context(|| format!("parsing credentials file {}", path.display()))?;
     Ok(creds)
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        use std::fmt::Write;
-        write!(out, "{b:02x}").expect("write to string");
-    }
-    out
-}
-
-fn hex_decode_fixed<const N: usize>(s: &str) -> anyhow::Result<[u8; N]> {
-    if s.len() != N * 2 {
-        anyhow::bail!("expected {} hex chars, got {}", N * 2, s.len());
-    }
-    let mut out = [0u8; N];
-    for i in 0..N {
-        out[i] = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16)?;
-    }
-    Ok(out)
 }
 
 #[cfg(test)]

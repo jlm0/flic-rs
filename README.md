@@ -18,10 +18,13 @@ implementation by the Flic team. Built from the public protocol documentation at
 
 ## Status
 
-Pre-1.0. The protocol is implemented end-to-end and validated against real hardware on
-macOS. Pairing, reconnect, steady-state event delivery, event continuity across drops,
-clean disconnect, and ACK dedup are all wired. Windows and Linux should work via
-`btleplug` but are not actively tested here.
+Pre-1.0. Protocol-conformant against the Flic 2 base and Duo specs — pairing,
+QuickVerify reconnect, steady-state event delivery, event continuity across drops,
+clean disconnect, and ACK dedup are all wired and exercised end-to-end on real
+macOS hardware. The public API may still narrow before 1.0 (low-level `session` /
+`protocol` / `transport` modules are exported today but are candidates for
+`unstable-internals` gating). Windows and Linux should work via `btleplug` but are
+not actively tested here.
 
 ## The three crates
 
@@ -136,24 +139,26 @@ repository's `.gitignore` already covers `creds.json`, `*.creds.json`, and
 ## End-to-end (Node)
 
 ```js
-import { FlicManager } from 'flic-napi';
+import { FlicManager, FlicEventKind } from 'flic-napi';
 
 const manager = await FlicManager.create();
 
 // Reconnect against a previously-paired button (creds from disk, keychain, HSM).
 const handle = await manager.connect(peripheralId, storedCreds, resumeState);
 
-manager.onEvent((ev) => {
+const subscription = manager.onEvent((ev) => {
   switch (ev.kind) {
-    case 'connected':     console.log('battery', ev.batteryMv, 'mV'); break;
-    case 'press':         console.log(ev.pressKind, 'at', ev.timestamp32K); break;
-    case 'reconnecting':  console.log('retry in', ev.afterMs, 'ms'); break;
-    case 'disconnected':  console.log('out:', ev.reason?.kind); break;
+    case FlicEventKind.Connected:    console.log('battery', ev.batteryMv, 'mV'); break;
+    case FlicEventKind.Press:        console.log(ev.pressKind, 'at', ev.timestamp32k); break;
+    case FlicEventKind.Reconnecting: console.log('retry in', ev.afterMs, 'ms'); break;
+    case FlicEventKind.Disconnected: console.log('out:', ev.reason?.kind); break;
+    case FlicEventKind.Lagged:       console.log('dropped', ev.laggedCount, 'events'); break;
   }
 });
 
 // Periodically persist handle.resumeState() so the button can suppress events
-// it has already delivered on a prior session.
+// it has already delivered on a prior session. When done, call
+// `await subscription.dispose()` to stop the listener.
 ```
 
 ## How it works

@@ -40,3 +40,61 @@ pub enum FlicError {
     #[error("cryptographic error: {0}")]
     Crypto(&'static str),
 }
+
+impl FlicError {
+    /// Returns a stable, screaming-snake-case identifier for this variant.
+    ///
+    /// This is the string binding layers use to let non-Rust callers branch
+    /// on the variant without parsing `Display` output. The set is closed —
+    /// adding a variant to `FlicError` requires adding a code here, and the
+    /// test below enforces that every variant has exactly one code.
+    #[must_use]
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::BluetoothOff => "BLUETOOTH_OFF",
+            Self::BleAdapterUnavailable(_) => "BLE_ADAPTER_UNAVAILABLE",
+            Self::NotFound => "NOT_FOUND",
+            Self::PairingFailed(_) => "PAIRING_FAILED",
+            Self::InvalidMac => "INVALID_MAC",
+            Self::Timeout { .. } => "TIMEOUT",
+            Self::ProtocolViolation(_) => "PROTOCOL_VIOLATION",
+            Self::Crypto(_) => "CRYPTO",
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn code_is_stable_screaming_snake_for_every_variant() {
+        // Enumerate every variant once — if a new one is added to the enum
+        // and this match isn't updated, the compiler fails this test for us.
+        let samples = [
+            FlicError::BluetoothOff,
+            FlicError::BleAdapterUnavailable("x".into()),
+            FlicError::NotFound,
+            FlicError::PairingFailed("x".into()),
+            FlicError::InvalidMac,
+            FlicError::Timeout { opcode: 0 },
+            FlicError::ProtocolViolation("x".into()),
+            FlicError::Crypto("x"),
+        ];
+        let codes: Vec<&'static str> = samples.iter().map(FlicError::code).collect();
+        assert_eq!(
+            codes,
+            [
+                "BLUETOOTH_OFF",
+                "BLE_ADAPTER_UNAVAILABLE",
+                "NOT_FOUND",
+                "PAIRING_FAILED",
+                "INVALID_MAC",
+                "TIMEOUT",
+                "PROTOCOL_VIOLATION",
+                "CRYPTO",
+            ]
+        );
+    }
+
+}

@@ -12,14 +12,12 @@ use std::time::Duration;
 
 use flic_core::manager::{FlicEvent as CoreFlicEvent, ReconnectingHandle};
 use flic_core::{
-    AdapterState as CoreAdapterState, DisconnectReason as CoreDisconnectReason,
+    hex, AdapterState as CoreAdapterState, DisconnectReason as CoreDisconnectReason,
     EventResumeState as CoreEventResumeState, FlicError, FlicManager as CoreFlicManager,
     PairingCredentials as CorePairingCredentials, PressKind as CorePressKind, ReconnectPolicy,
 };
 use napi::bindgen_prelude::*;
-use napi::threadsafe_function::{
-    ErrorStrategy, ThreadsafeFunction, ThreadsafeFunctionCallMode,
-};
+use napi::threadsafe_function::{ErrorStrategy, ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi::JsFunction;
 use napi_derive::napi;
 
@@ -77,17 +75,17 @@ impl PairingCredentials {
     fn from_core(c: CorePairingCredentials) -> Self {
         Self {
             pairing_id: c.pairing_id,
-            pairing_key_hex: hex_encode(&c.pairing_key),
+            pairing_key_hex: hex::encode(&c.pairing_key),
             serial_number: c.serial_number,
-            button_uuid_hex: hex_encode(&c.button_uuid),
+            button_uuid_hex: hex::encode(&c.button_uuid),
             firmware_version: c.firmware_version,
         }
     }
 
     fn to_core(&self) -> Result<CorePairingCredentials> {
-        let pairing_key = hex_decode_fixed::<16>(&self.pairing_key_hex)
+        let pairing_key = hex::decode_fixed::<16>(&self.pairing_key_hex)
             .ok_or_else(|| Error::new(Status::InvalidArg, "pairingKeyHex must be 32 hex chars"))?;
-        let button_uuid = hex_decode_fixed::<16>(&self.button_uuid_hex)
+        let button_uuid = hex::decode_fixed::<16>(&self.button_uuid_hex)
             .ok_or_else(|| Error::new(Status::InvalidArg, "buttonUuidHex must be 32 hex chars"))?;
         Ok(CorePairingCredentials {
             pairing_id: self.pairing_id,
@@ -151,17 +149,29 @@ impl From<CorePressKind> for PressKind {
     }
 }
 
+/// Discriminant for [`DisconnectReason`]. Stable string-enum that lets TS
+/// consumers `switch` on the variant without parsing free-form strings.
+#[napi(string_enum)]
+pub enum DisconnectReasonKind {
+    PingTimeout,
+    InvalidSignature,
+    StartedNewWithSamePairingId,
+    ByUser,
+    BleTransport,
+    HandshakeFailed,
+    UnknownFromButton,
+}
+
 /// Why a session ended. `kind` is the stable discriminant; `message` and
-/// `opcode` carry context for specific variants (see comments below).
+/// `opcode` carry context for specific variants.
+///
+/// - `BleTransport` + `HandshakeFailed` populate `message` with diagnostic text.
+/// - `UnknownFromButton` populates `opcode` with the wire-level opcode.
+/// - Other variants leave both `None`.
 #[napi(object)]
 pub struct DisconnectReason {
-    /// One of: `"pingTimeout"`, `"invalidSignature"`,
-    /// `"startedNewWithSamePairingId"`, `"byUser"`, `"bleTransport"`,
-    /// `"handshakeFailed"`, `"unknownFromButton"`.
-    pub kind: String,
-    /// Present on `bleTransport` + `handshakeFailed` — diagnostic text only.
+    pub kind: DisconnectReasonKind,
     pub message: Option<String>,
-    /// Present on `unknownFromButton` — the wire-level opcode the button sent.
     pub opcode: Option<u32>,
 }
 
@@ -169,37 +179,37 @@ impl From<CoreDisconnectReason> for DisconnectReason {
     fn from(r: CoreDisconnectReason) -> Self {
         match r {
             CoreDisconnectReason::PingTimeout => Self {
-                kind: "pingTimeout".into(),
+                kind: DisconnectReasonKind::PingTimeout,
                 message: None,
                 opcode: None,
             },
             CoreDisconnectReason::InvalidSignature => Self {
-                kind: "invalidSignature".into(),
+                kind: DisconnectReasonKind::InvalidSignature,
                 message: None,
                 opcode: None,
             },
             CoreDisconnectReason::StartedNewWithSamePairingId => Self {
-                kind: "startedNewWithSamePairingId".into(),
+                kind: DisconnectReasonKind::StartedNewWithSamePairingId,
                 message: None,
                 opcode: None,
             },
             CoreDisconnectReason::ByUser => Self {
-                kind: "byUser".into(),
+                kind: DisconnectReasonKind::ByUser,
                 message: None,
                 opcode: None,
             },
             CoreDisconnectReason::BleTransport(m) => Self {
-                kind: "bleTransport".into(),
+                kind: DisconnectReasonKind::BleTransport,
                 message: Some(m),
                 opcode: None,
             },
             CoreDisconnectReason::HandshakeFailed(m) => Self {
-                kind: "handshakeFailed".into(),
+                kind: DisconnectReasonKind::HandshakeFailed,
                 message: Some(m),
                 opcode: None,
             },
             CoreDisconnectReason::UnknownFromButton(op) => Self {
-                kind: "unknownFromButton".into(),
+                kind: DisconnectReasonKind::UnknownFromButton,
                 message: None,
                 opcode: Some(u32::from(op)),
             },
@@ -207,24 +217,48 @@ impl From<CoreDisconnectReason> for DisconnectReason {
     }
 }
 
-/// An event from the flic subsystem. `kind` discriminates; the remaining
-/// fields are payload-bearing per variant (see below).
+/// Discriminant for [`FlicEvent`]. Stable string-enum — TS consumers should
+/// narrow by comparing `event.kind` to these variants rather than string
+/// literals.
 ///
-/// - `"connected"`: `peripheralId`, `batteryMv`, `firmware`
-/// - `"press"`: `peripheralId`, `pressKind`, `timestamp32k`, `wasQueued`
-/// - `"eventsResumed"`: `peripheralId`, `eventCount`, `bootId`, `hasQueued`
-/// - `"disconnected"`: `peripheralId`, `reason`
-/// - `"reconnecting"`: `peripheralId`, `attempt`, `afterMs`, `lastReason`
-/// - `"adapterUnavailable"`: `peripheralId`
+/// `Lagged` is emitted when the underlying broadcast channel dropped
+/// events because the subscriber fell behind. It carries `laggedCount`;
+/// no peripheral-scoped fields are meaningful.
+#[napi(string_enum)]
+pub enum FlicEventKind {
+    Connected,
+    Press,
+    EventsResumed,
+    Disconnected,
+    Reconnecting,
+    AdapterUnavailable,
+    Lagged,
+}
+
+/// An event from the flic subsystem. `kind` discriminates; the remaining
+/// fields are payload-bearing per variant.
+///
+/// napi-rs v2 cannot emit discriminated unions directly, so we model this
+/// as a flat struct with an enum discriminant and variant-specific optional
+/// fields. Which fields are populated for each `kind`:
+///
+/// - `Connected`: `peripheralId`, `batteryMv`, `firmware`
+/// - `Press`: `peripheralId`, `pressKind`, `timestamp32k`, `wasQueued`
+/// - `EventsResumed`: `peripheralId`, `eventCount`, `bootId`, `hasQueued`
+/// - `Disconnected`: `peripheralId`, `reason`
+/// - `Reconnecting`: `peripheralId`, `attempt`, `afterMs`, `lastReason`
+/// - `AdapterUnavailable`: `peripheralId`
+/// - `Lagged`: `laggedCount` (`peripheralId` is empty)
 #[napi(object)]
 pub struct FlicEvent {
-    pub kind: String,
+    pub kind: FlicEventKind,
     pub peripheral_id: String,
     pub battery_mv: Option<u32>,
     pub firmware: Option<u32>,
     pub press_kind: Option<PressKind>,
     /// 32.768 kHz timer on the button. Value is a JS number (f64) — precision
     /// is safe for all practical session durations.
+    #[napi(js_name = "timestamp32k")]
     pub timestamp32k: Option<f64>,
     pub was_queued: Option<bool>,
     pub event_count: Option<u32>,
@@ -234,21 +268,35 @@ pub struct FlicEvent {
     pub attempt: Option<u32>,
     pub after_ms: Option<u32>,
     pub last_reason: Option<DisconnectReason>,
+    pub lagged_count: Option<u32>,
 }
 
 impl FlicEvent {
     fn from_core(ev: CoreFlicEvent) -> Self {
+        // Each variant is constructed with every field spelled out. No
+        // `..Default::default()` or shared builder — the compiler must
+        // catch a missing field when we add a new one.
         match ev {
             CoreFlicEvent::Connected {
                 id,
                 battery_voltage_mv,
                 firmware_version,
             } => Self {
-                kind: "connected".into(),
+                kind: FlicEventKind::Connected,
                 peripheral_id: id,
                 battery_mv: Some(u32::from(battery_voltage_mv)),
                 firmware: Some(firmware_version),
-                ..empty()
+                press_kind: None,
+                timestamp32k: None,
+                was_queued: None,
+                event_count: None,
+                boot_id: None,
+                has_queued: None,
+                reason: None,
+                attempt: None,
+                after_ms: None,
+                last_reason: None,
+                lagged_count: None,
             },
             CoreFlicEvent::ButtonPressed {
                 id,
@@ -256,12 +304,21 @@ impl FlicEvent {
                 timestamp_32k,
                 was_queued,
             } => Self {
-                kind: "press".into(),
+                kind: FlicEventKind::Press,
                 peripheral_id: id,
+                battery_mv: None,
+                firmware: None,
                 press_kind: Some(kind.into()),
                 timestamp32k: Some(timestamp_32k as f64),
                 was_queued: Some(was_queued),
-                ..empty()
+                event_count: None,
+                boot_id: None,
+                has_queued: None,
+                reason: None,
+                attempt: None,
+                after_ms: None,
+                last_reason: None,
+                lagged_count: None,
             },
             CoreFlicEvent::EventsResumed {
                 id,
@@ -269,18 +326,38 @@ impl FlicEvent {
                 boot_id,
                 has_queued_events,
             } => Self {
-                kind: "eventsResumed".into(),
+                kind: FlicEventKind::EventsResumed,
                 peripheral_id: id,
+                battery_mv: None,
+                firmware: None,
+                press_kind: None,
+                timestamp32k: None,
+                was_queued: None,
                 event_count: Some(event_count),
                 boot_id: Some(boot_id),
                 has_queued: Some(has_queued_events),
-                ..empty()
+                reason: None,
+                attempt: None,
+                after_ms: None,
+                last_reason: None,
+                lagged_count: None,
             },
             CoreFlicEvent::Disconnected { id, reason } => Self {
-                kind: "disconnected".into(),
+                kind: FlicEventKind::Disconnected,
                 peripheral_id: id,
+                battery_mv: None,
+                firmware: None,
+                press_kind: None,
+                timestamp32k: None,
+                was_queued: None,
+                event_count: None,
+                boot_id: None,
+                has_queued: None,
                 reason: Some(reason.into()),
-                ..empty()
+                attempt: None,
+                after_ms: None,
+                last_reason: None,
+                lagged_count: None,
             },
             CoreFlicEvent::Reconnecting {
                 id,
@@ -288,38 +365,103 @@ impl FlicEvent {
                 after_millis,
                 last_reason,
             } => Self {
-                kind: "reconnecting".into(),
+                kind: FlicEventKind::Reconnecting,
                 peripheral_id: id,
+                battery_mv: None,
+                firmware: None,
+                press_kind: None,
+                timestamp32k: None,
+                was_queued: None,
+                event_count: None,
+                boot_id: None,
+                has_queued: None,
+                reason: None,
                 attempt: Some(attempt),
                 after_ms: Some(u32::try_from(after_millis).unwrap_or(u32::MAX)),
                 last_reason: Some(last_reason.into()),
-                ..empty()
+                lagged_count: None,
             },
             CoreFlicEvent::AdapterUnavailable { id } => Self {
-                kind: "adapterUnavailable".into(),
+                kind: FlicEventKind::AdapterUnavailable,
                 peripheral_id: id,
-                ..empty()
+                battery_mv: None,
+                firmware: None,
+                press_kind: None,
+                timestamp32k: None,
+                was_queued: None,
+                event_count: None,
+                boot_id: None,
+                has_queued: None,
+                reason: None,
+                attempt: None,
+                after_ms: None,
+                last_reason: None,
+                lagged_count: None,
             },
+        }
+    }
+
+    /// Synthetic event emitted when the broadcast channel reports that the
+    /// subscriber lagged and dropped `count` events. Not sourced from
+    /// `flic-core` — manufactured here so JS consumers can see gaps.
+    fn lagged(count: u64) -> Self {
+        Self {
+            kind: FlicEventKind::Lagged,
+            peripheral_id: String::new(),
+            battery_mv: None,
+            firmware: None,
+            press_kind: None,
+            timestamp32k: None,
+            was_queued: None,
+            event_count: None,
+            boot_id: None,
+            has_queued: None,
+            reason: None,
+            attempt: None,
+            after_ms: None,
+            last_reason: None,
+            lagged_count: Some(u32::try_from(count).unwrap_or(u32::MAX)),
         }
     }
 }
 
-fn empty() -> FlicEvent {
-    FlicEvent {
-        kind: String::new(),
-        peripheral_id: String::new(),
-        battery_mv: None,
-        firmware: None,
-        press_kind: None,
-        timestamp32k: None,
-        was_queued: None,
-        event_count: None,
-        boot_id: None,
-        has_queued: None,
-        reason: None,
-        attempt: None,
-        after_ms: None,
-        last_reason: None,
+/// Handle returned by [`FlicManager::on_event`]. Owns the background task
+/// that drains the broadcast receiver and forwards events to JS.
+///
+/// Call `dispose()` to stop the listener. Dropping the handle without
+/// calling `dispose()` does NOT cancel the task — napi-rs moves it to JS
+/// where Rust's `Drop` never fires. Always `dispose()` when done.
+#[napi]
+pub struct Subscription {
+    task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+#[napi]
+impl Subscription {
+    /// Cancels the background listener. Idempotent — calling twice is a
+    /// no-op on the second call.
+    #[napi]
+    pub async fn dispose(&self) {
+        let taken = self
+            .task
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(task) = taken {
+            task.abort();
+            match task.await {
+                // Expected: our own `abort()` resolves as `Cancelled`.
+                Ok(()) => {}
+                Err(e) if e.is_cancelled() => {}
+                // The forwarding task panicked before we aborted it (e.g.
+                // a broken JS callback). Dropping this silently would mask
+                // a real bug — surface it to stderr so it lands in the
+                // Node host's log.
+                Err(e) => {
+                    eprintln!("flic-napi: on_event forwarding task exited abnormally: {e}");
+                }
+            }
+        }
     }
 }
 
@@ -338,7 +480,11 @@ impl ConnectionHandle {
     /// Idempotent — calling twice is a no-op on the second call.
     #[napi]
     pub async fn disconnect(&self) {
-        let taken = self.handle.lock().expect("lock poisoned").take();
+        let taken = self
+            .handle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
         if let Some(h) = taken {
             h.disconnect().await;
         }
@@ -350,7 +496,7 @@ impl ConnectionHandle {
     pub fn resume_state(&self) -> Option<EventResumeState> {
         self.handle
             .lock()
-            .expect("lock poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .as_ref()
             .map(|h| EventResumeState::from_core(h.resume_state()))
     }
@@ -412,9 +558,10 @@ impl FlicManager {
     /// `PairingCredentials` is the identity used for every subsequent
     /// `connect()` — the host must persist it.
     ///
-    /// The button enters Public Mode after a ~7-second hold (LED flashes
-    /// rapidly, then two extra flashes after release). You have ~30s from that
-    /// point before the button exits pairing mode.
+    /// The button enters Public Mode after a ~7-second hold. Flic 2 has no
+    /// LED or audible feedback — the UI above this binding is responsible
+    /// for telling the user to count the hold by the clock. You have ~30s
+    /// from release before the button exits pairing mode.
     #[napi]
     pub async fn pair(
         &self,
@@ -423,14 +570,13 @@ impl FlicManager {
     ) -> Result<PairingCredentials> {
         let discovery = self
             .inner
-            .find(&peripheral_id, Duration::from_millis(u64::from(find_timeout_ms)))
+            .find(
+                &peripheral_id,
+                Duration::from_millis(u64::from(find_timeout_ms)),
+            )
             .await
             .map_err(to_napi_err)?;
-        let creds = self
-            .inner
-            .pair(&discovery.id)
-            .await
-            .map_err(to_napi_err)?;
+        let creds = self.inner.pair(&discovery.id).await.map_err(to_napi_err)?;
         Ok(PairingCredentials::from_core(creds))
     }
 
@@ -440,16 +586,18 @@ impl FlicManager {
     ///
     /// The callback is invoked from a Rust background task via a
     /// `ThreadsafeFunction` — it runs on the Node event loop, not off-thread.
-    /// `NonBlocking` delivery: if the Node side is overwhelmed, events drop
-    /// rather than block Rust. (Press rates are human-scale; this is belt-
-    /// and-braces.)
+    /// `NonBlocking` delivery: if Node is overwhelmed, events drop rather
+    /// than block Rust, and a synthetic `Lagged` event surfaces the count.
+    ///
+    /// Returns a `Subscription`. Call `dispose()` on it to stop the listener;
+    /// dropping the handle without `dispose()` leaks the background task.
     #[napi(ts_args_type = "callback: (event: FlicEvent) => void")]
-    pub fn on_event(&self, callback: JsFunction) -> Result<()> {
+    pub fn on_event(&self, callback: JsFunction) -> Result<Subscription> {
         let tsfn: ThreadsafeFunction<FlicEvent, ErrorStrategy::Fatal> =
             callback.create_threadsafe_function(0, |ctx| Ok(vec![ctx.value]))?;
 
         let mut rx = self.inner.subscribe();
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             loop {
                 match rx.recv().await {
                     Ok(ev) => {
@@ -459,11 +607,18 @@ impl FlicManager {
                         );
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tsfn.call(
+                            FlicEvent::lagged(n),
+                            ThreadsafeFunctionCallMode::NonBlocking,
+                        );
+                    }
                 }
             }
         });
-        Ok(())
+        Ok(Subscription {
+            task: Mutex::new(Some(task)),
+        })
     }
 
     /// Connects to a previously-paired Flic and starts the reconnect
@@ -497,43 +652,13 @@ impl FlicManager {
     }
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        use std::fmt::Write;
-        write!(out, "{b:02x}").expect("write to string");
-    }
-    out
-}
-
-fn hex_decode_fixed<const N: usize>(s: &str) -> Option<[u8; N]> {
-    if s.len() != N * 2 {
-        return None;
-    }
-    let mut out = [0u8; N];
-    for i in 0..N {
-        out[i] = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
-    }
-    Some(out)
-}
-
 /// Maps a `FlicError` to a napi error whose message carries a stable code
 /// prefix for JS narrowing. Format: `CODE: human-readable message`.
 ///
-/// Callers on the JS side should parse the prefix up to the first `:` and
-/// match against the documented code set.
+/// The code set is defined by `FlicError::code()` — binding consumers
+/// should parse the prefix up to the first `:` and match against that.
 fn to_napi_err(e: FlicError) -> Error {
-    let code = match &e {
-        FlicError::BluetoothOff => "BLUETOOTH_OFF",
-        FlicError::BleAdapterUnavailable(_) => "BLE_ADAPTER_UNAVAILABLE",
-        FlicError::NotFound => "NOT_FOUND",
-        FlicError::PairingFailed(_) => "PAIRING_FAILED",
-        FlicError::InvalidMac => "INVALID_MAC",
-        FlicError::Timeout { .. } => "TIMEOUT",
-        FlicError::ProtocolViolation(_) => "PROTOCOL_VIOLATION",
-        FlicError::Crypto(_) => "CRYPTO",
-    };
-    Error::new(Status::GenericFailure, format!("{code}: {e}"))
+    Error::new(Status::GenericFailure, format!("{}: {e}", e.code()))
 }
 
 #[cfg(test)]
@@ -571,5 +696,32 @@ mod tests {
             firmware_version: 1,
         };
         assert!(bad.to_core().is_err());
+    }
+
+    #[test]
+    fn flic_event_lagged_carries_count_and_empty_peripheral_id() {
+        let ev = FlicEvent::lagged(7);
+        assert!(matches!(ev.kind, FlicEventKind::Lagged));
+        assert_eq!(ev.peripheral_id, "");
+        assert_eq!(ev.lagged_count, Some(7));
+        assert!(ev.battery_mv.is_none());
+        assert!(ev.press_kind.is_none());
+        assert!(ev.reason.is_none());
+    }
+
+    #[test]
+    fn flic_event_lagged_saturates_at_u32_max() {
+        let ev = FlicEvent::lagged(u64::MAX);
+        assert_eq!(ev.lagged_count, Some(u32::MAX));
+    }
+
+    #[test]
+    fn to_napi_err_prefix_uses_flic_error_code() {
+        let err = to_napi_err(FlicError::NotFound);
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("NOT_FOUND"),
+            "expected NOT_FOUND prefix, got {msg}"
+        );
     }
 }
